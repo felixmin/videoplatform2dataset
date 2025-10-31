@@ -7,7 +7,7 @@ A production-ready video processing pipeline designed for moderate-scale deep le
 - **Parallel Downloads**: Download multiple videos concurrently with progress tracking
 - **Integrity Validation**: FFmpeg-based validation and black frame detection
 - **Scene Detection**: Automatic scene boundary detection using PySceneDetect
-- **High-Performance Decoding**: GPU-accelerated video decoding with Decord
+- **Video Decoding**: Fast video frame extraction using OpenCV
 - **Frame Extraction**: Extract frames from scenes with optional entropy-based deduplication
 - **Metadata Tracking**: Comprehensive manifest system for processing history
 
@@ -17,7 +17,6 @@ A production-ready video processing pipeline designed for moderate-scale deep le
 
 - Python 3.10+ (CPython) or 3.11+ (PyPy)
 - FFmpeg (for video processing)
-- NVIDIA GPU (optional, for GPU acceleration)
 
 ### Install Dependencies
 
@@ -36,17 +35,6 @@ brew install ffmpeg
 # Download from https://ffmpeg.org/download.html
 ```
 
-### Install Decord (GPU Support)
-
-For GPU acceleration, Decord may need special installation:
-
-```bash
-# Using conda (recommended)
-conda install -c conda-forge decord
-
-# Or build from source
-pip install --no-binary decord decord
-```
 
 ## Quick Start
 
@@ -115,7 +103,7 @@ Options:
   --enable-deduplication      Enable entropy-based deduplication
   --resolution WIDTHxHEIGHT   Output resolution (e.g., 640x480)
   --jpeg-quality N            JPEG quality 1-100
-  --use-cpu                   Disable GPU acceleration
+  --use-cpu                   Reserved for future use (currently uses CPU decoding)
   --skip-validation           Skip integrity validation
   -v, --verbose               Verbose logging
 ```
@@ -131,7 +119,7 @@ video_dataset_processor/
 │   ├── __init__.py
 │   ├── downloader.py          # Parallel video downloads
 │   ├── integrity_checker.py   # Video validation
-│   ├── video_decoder.py       # Decord-based decoding
+│   ├── video_decoder.py       # OpenCV-based video decoding
 │   ├── scene_detector.py      # Scene detection
 │   ├── frame_processor.py     # Frame extraction
 │   ├── manifest_manager.py    # Metadata tracking
@@ -173,27 +161,28 @@ For **20 videos × 1.5 hours** (30 hours total):
 | Download (4 workers) | 2-6 hours |
 | Validation | 30-60 minutes |
 | Scene Detection | 15-30 minutes |
-| Frame Extraction (GPU) | 1-2 hours |
+| Frame Extraction | 2-4 hours |
 | **Total** | **4-10 hours** |
 
 ## Hardware Recommendations
 
-- **CPU**: 6-8 cores (for parallel downloads)
+- **CPU**: 6-8 cores (for parallel downloads and video decoding)
 - **RAM**: 16GB+
-- **GPU**: NVIDIA with NVDEC (GTX 1060+) for 3-5x speedup
 - **Storage**: SSD recommended (500GB+ for raw + processed)
 
 ## Troubleshooting
 
-### Decord import fails
+### OpenCV installation issues
+
+If `opencv-python` fails to install:
 
 ```bash
-conda install -c conda-forge decord
+# Try the headless version (no GUI dependencies)
+pip install opencv-python-headless
+
+# Or install from conda
+conda install -c conda-forge opencv
 ```
-
-### GPU not detected
-
-Decord will automatically fall back to CPU if GPU is unavailable.
 
 ### FFmpeg not found
 
@@ -223,8 +212,7 @@ This is a production-ready implementation. For improvements:
 
 Built with:
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) - Video downloading
-- [Decord](https://github.com/dmlc/decord) - High-performance video decoding
+- [OpenCV](https://opencv.org/) - Video decoding and processing
 - [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) - Scene detection
-- [OpenCV](https://opencv.org/) - Video processing
 - [Pillow](https://python-pillow.org/) - Image processing
 

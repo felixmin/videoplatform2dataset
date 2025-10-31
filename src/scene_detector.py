@@ -85,12 +85,21 @@ class SceneDetector:
             scene_manager = SceneManager()
             scene_manager.add_detector(self._create_detector())
             
-            # Detect with downscaling
-            scene_manager.detect_scenes(
-                video=video,
-                show_progress=show_progress,
-                downscale=self.downscale_factor
-            )
+            # Detect scenes (try with downscale first, fall back if not supported)
+            try:
+                # Try with downscale parameter (newer versions)
+                scene_manager.detect_scenes(
+                    video=video,
+                    show_progress=show_progress,
+                    downscale=self.downscale_factor
+                )
+            except TypeError:
+                # Fall back to without downscale (older versions or different API)
+                self.logger.debug(f"downscale parameter not supported, using default resolution")
+                scene_manager.detect_scenes(
+                    video=video,
+                    show_progress=show_progress
+                )
             
             # Convert to frame numbers
             scenes = []

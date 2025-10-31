@@ -1,6 +1,5 @@
 # Core video processing
 yt-dlp>=2024.8.0
-decord>=0.6.0
 scenedetect[opencv]>=0.6.2
 
 # Image processing

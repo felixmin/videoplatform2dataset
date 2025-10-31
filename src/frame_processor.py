@@ -10,6 +10,8 @@ from typing import List, Tuple, Optional, Dict
 from PIL import Image
 from tqdm import tqdm
 from scipy.stats import entropy
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import cpu_count
 
 from .video_decoder import VideoDecoder
 from .utils import ensure_dir
@@ -27,6 +29,7 @@ class FrameProcessor:
         jpeg_quality: int = 85,
         enable_deduplication: bool = False,
         entropy_percentile: float = 50.0,  # Keep frames above this percentile
+        num_workers: Optional[int] = None,  # Number of parallel workers
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -38,6 +41,7 @@ class FrameProcessor:
             jpeg_quality: JPEG quality (1-100)
             enable_deduplication: Enable entropy-based deduplication
             entropy_percentile: Percentile threshold for frame selection
+            num_workers: Number of parallel workers (None = auto-detect)
             logger: Logger instance
         """
         self.output_dir = ensure_dir(output_dir)
@@ -45,6 +49,7 @@ class FrameProcessor:
         self.jpeg_quality = jpeg_quality
         self.enable_deduplication = enable_deduplication
         self.entropy_percentile = entropy_percentile
+        self.num_workers = num_workers or min(4, cpu_count())
         self.logger = logger or logging.getLogger(__name__)
     
     def _calculate_frame_entropy(self, frame: np.ndarray) -> float:
@@ -95,11 +100,22 @@ class FrameProcessor:
             return frame_indices
         
         # Calculate entropy for all frames
+        # Use sequential reading for faster entropy calculation
         entropies = []
-        for idx in frame_indices:
-            frame = decoder[idx]
-            ent = self._calculate_frame_entropy(frame)
-            entropies.append(ent)
+        
+        # Read all frames in batch for faster processing
+        try:
+            frames = decoder.get_frame_range(start_frame, end_frame)
+            for frame in frames:
+                ent = self._calculate_frame_entropy(frame)
+                entropies.append(ent)
+        except Exception:
+            # Fallback to individual reads if batch fails
+            self.logger.warning("Batch frame reading failed, using individual reads (slower)")
+            for idx in frame_indices:
+                frame = decoder[idx]
+                ent = self._calculate_frame_entropy(frame)
+                entropies.append(ent)
         
         # Select frames above percentile threshold
         threshold = np.percentile(entropies, self.entropy_percentile)
@@ -156,28 +172,103 @@ class FrameProcessor:
         # Extract and save frames
         saved_count = 0
         
-        for local_idx, frame_idx in enumerate(selected_indices):
-            # Get frame
-            frame = decoder[frame_idx]  # Already RGB from Decord
+        # Check if frames are consecutive (for efficient sequential reading)
+        is_consecutive = (
+            len(selected_indices) > 1 and
+            selected_indices == list(range(selected_indices[0], selected_indices[-1] + 1))
+        )
+        
+        if is_consecutive:
+            # Fast path: sequential read for consecutive frames
+            frames = decoder.get_frame_range(selected_indices[0], selected_indices[-1] + 1)
             
-            # Create PIL Image
-            pil_img = Image.fromarray(frame)
+            for local_idx, frame in enumerate(frames):
+                # Create PIL Image
+                pil_img = Image.fromarray(frame)
+                
+                # Resize if needed
+                if self.output_resolution is not None:
+                    pil_img = pil_img.resize(self.output_resolution, Image.LANCZOS)
+                
+                # Save
+                output_path = scene_dir / f"frame_{local_idx:04d}.jpg"
+                pil_img.save(
+                    str(output_path),
+                    'JPEG',
+                    quality=self.jpeg_quality,
+                    optimize=True,
+                    subsampling=0  # Best quality
+                )
+                
+                saved_count += 1
+        else:
+            # Slow path: random access (for deduplication or non-consecutive frames)
+            # Create mapping from frame_idx to local_idx for O(1) lookup
+            frame_to_local = {frame_idx: local_idx for local_idx, frame_idx in enumerate(selected_indices)}
             
-            # Resize if needed
-            if self.output_resolution is not None:
-                pil_img = pil_img.resize(self.output_resolution, Image.LANCZOS)
+            # Try to batch consecutive groups when possible
+            sorted_indices = sorted(selected_indices)
             
-            # Save
-            output_path = scene_dir / f"frame_{local_idx:04d}.jpg"
-            pil_img.save(
-                str(output_path),
-                'JPEG',
-                quality=self.jpeg_quality,
-                optimize=True,
-                subsampling=0  # Best quality
-            )
-            
-            saved_count += 1
+            i = 0
+            while i < len(sorted_indices):
+                # Find consecutive sequence
+                start_idx = sorted_indices[i]
+                j = i + 1
+                while j < len(sorted_indices) and sorted_indices[j] == sorted_indices[j-1] + 1:
+                    j += 1
+                
+                # If we have consecutive frames, read them in batch
+                if j - i > 1:
+                    end_idx = sorted_indices[j-1] + 1
+                    frames = decoder.get_frame_range(start_idx, end_idx)
+                    
+                    for offset, frame in enumerate(frames):
+                        frame_idx = start_idx + offset
+                        local_idx = frame_to_local[frame_idx]
+                        
+                        # Create PIL Image
+                        pil_img = Image.fromarray(frame)
+                        
+                        # Resize if needed
+                        if self.output_resolution is not None:
+                            pil_img = pil_img.resize(self.output_resolution, Image.LANCZOS)
+                        
+                        # Save
+                        output_path = scene_dir / f"frame_{local_idx:04d}.jpg"
+                        pil_img.save(
+                            str(output_path),
+                            'JPEG',
+                            quality=self.jpeg_quality,
+                            optimize=True,
+                            subsampling=0  # Best quality
+                        )
+                        
+                        saved_count += 1
+                else:
+                    # Single frame, use random access
+                    frame = decoder[sorted_indices[i]]
+                    local_idx = frame_to_local[sorted_indices[i]]
+                    
+                    # Create PIL Image
+                    pil_img = Image.fromarray(frame)
+                    
+                    # Resize if needed
+                    if self.output_resolution is not None:
+                        pil_img = pil_img.resize(self.output_resolution, Image.LANCZOS)
+                    
+                    # Save
+                    output_path = scene_dir / f"frame_{local_idx:04d}.jpg"
+                    pil_img.save(
+                        str(output_path),
+                        'JPEG',
+                        quality=self.jpeg_quality,
+                        optimize=True,
+                        subsampling=0  # Best quality
+                    )
+                    
+                    saved_count += 1
+                
+                i = j
         
         metadata = {
             'scene_idx': scene_idx,
@@ -196,6 +287,46 @@ class FrameProcessor:
         
         return metadata
     
+    def _process_single_scene(
+        self,
+        video_path: str,
+        scene: Tuple[int, int],
+        scene_idx: int,
+        video_name: str,
+        flat_structure: bool,
+        use_gpu: bool
+    ) -> Dict:
+        """
+        Process a single scene (worker function for parallel processing).
+        Each worker gets its own VideoDecoder instance.
+        
+        Args:
+            video_path: Path to video file
+            scene: (start_frame, end_frame) tuple
+            scene_idx: Scene index
+            video_name: Video name for folder
+            flat_structure: Use flat folder structure
+            use_gpu: Use GPU for decoding
+        
+        Returns:
+            Scene metadata dict
+        """
+        # Create decoder instance for this worker
+        decoder = VideoDecoder(video_path, use_gpu=use_gpu, logger=self.logger)
+        
+        try:
+            return self.process_scene(
+                decoder,
+                scene,
+                scene_idx,
+                video_name,
+                flat_structure
+            )
+        finally:
+            # Cleanup decoder
+            if hasattr(decoder, 'cap'):
+                decoder.cap.release()
+    
     def process_video(
         self,
         video_path: str,
@@ -204,7 +335,7 @@ class FrameProcessor:
         use_gpu: bool = True
     ) -> List[Dict]:
         """
-        Process all scenes in a video.
+        Process all scenes in a video with optional parallel processing.
         
         Args:
             video_path: Path to video file
@@ -219,29 +350,79 @@ class FrameProcessor:
         
         self.logger.info(
             f"Processing {len(scenes)} scenes from {video_name} "
-            f"(deduplication={self.enable_deduplication})"
+            f"(deduplication={self.enable_deduplication}, workers={self.num_workers})"
         )
-        
-        # Open video with Decord
-        decoder = VideoDecoder(video_path, use_gpu=use_gpu, logger=self.logger)
         
         scene_metadata = []
         
-        for scene_idx, scene in enumerate(tqdm(
-            scenes, 
-            desc=f"Processing {video_name}", 
-            unit="scene"
-        )):
-            metadata = self.process_scene(
-                decoder,
-                scene,
-                scene_idx,
-                video_name,
-                flat_structure
-            )
-            scene_metadata.append(metadata)
+        # Use parallel processing if we have multiple scenes and workers
+        if len(scenes) > 1 and self.num_workers > 1:
+            # Prepare arguments for each scene
+            scene_args = [
+                (video_path, scene, scene_idx, video_name, flat_structure, use_gpu)
+                for scene_idx, scene in enumerate(scenes)
+            ]
+            
+            # Process scenes in parallel
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                # Submit all tasks
+                future_to_scene = {
+                    executor.submit(self._process_single_scene, *args): idx
+                    for idx, args in enumerate(scene_args)
+                }
+                
+                # Collect results with progress bar
+                scene_results = [None] * len(scenes)
+                
+                for future in tqdm(
+                    as_completed(future_to_scene),
+                    total=len(scenes),
+                    desc=f"Processing {video_name}",
+                    unit="scene"
+                ):
+                    scene_idx = future_to_scene[future]
+                    try:
+                        scene_results[scene_idx] = future.result()
+                    except Exception as e:
+                        self.logger.error(f"Error processing scene {scene_idx}: {str(e)}")
+                        # Create error metadata
+                        start_frame, end_frame = scenes[scene_idx]
+                        scene_results[scene_idx] = {
+                            'scene_idx': scene_idx,
+                            'start_frame': start_frame,
+                            'end_frame': end_frame,
+                            'total_frames': end_frame - start_frame,
+                            'selected_frames': 0,
+                            'saved_frames': 0,
+                            'output_dir': '',
+                            'deduplication_enabled': self.enable_deduplication,
+                            'error': str(e)
+                        }
+                
+                scene_metadata = scene_results
+        else:
+            # Sequential processing (single scene or single worker)
+            decoder = VideoDecoder(video_path, use_gpu=use_gpu, logger=self.logger)
+            
+            try:
+                for scene_idx, scene in enumerate(tqdm(
+                    scenes, 
+                    desc=f"Processing {video_name}", 
+                    unit="scene"
+                )):
+                    metadata = self.process_scene(
+                        decoder,
+                        scene,
+                        scene_idx,
+                        video_name,
+                        flat_structure
+                    )
+                    scene_metadata.append(metadata)
+            finally:
+                if hasattr(decoder, 'cap'):
+                    decoder.cap.release()
         
-        total_frames = sum(m['saved_frames'] for m in scene_metadata)
+        total_frames = sum(m.get('saved_frames', 0) for m in scene_metadata)
         self.logger.info(f"Processed {video_name}: {total_frames} frames extracted")
         
         return scene_metadata

@@ -5,10 +5,24 @@ Video integrity checking using FFmpeg and frame analysis
 import subprocess
 import logging
 import numpy as np
+import os
+import sys
 from pathlib import Path
 from typing import Tuple, Optional, Dict
+from contextlib import contextmanager
 
-from .video_decoder import VideoDecoder
+from .video_decoder import VideoDecoder, FilteredStderr
+
+
+@contextmanager
+def suppress_stderr():
+    """Context manager to suppress stderr (for OpenCV h264 warnings)."""
+    old_stderr = sys.stderr
+    try:
+        sys.stderr = FilteredStderr(old_stderr)
+        yield
+    finally:
+        sys.stderr = old_stderr
 
 
 class IntegrityChecker:
@@ -51,6 +65,9 @@ class IntegrityChecker:
                 '-v', 'error',           # Only show errors
                 '-i', video_path,         # Input file
                 '-f', 'null',             # Output to null
+                '-hide_banner',           # Hide banner
+                '-nostats',               # Hide statistics
+                '-loglevel', 'error',     # Only errors (suppress warnings)
                 '-'                       # Stdout
             ]
             
@@ -104,16 +121,20 @@ class IntegrityChecker:
             (black_ratio, num_black, total_sampled)
         """
         try:
-            decoder = VideoDecoder(video_path, use_gpu=False, logger=self.logger)
-            total_frames = len(decoder)
+            # Suppress h264 warnings during decoder initialization and frame reading
+            with suppress_stderr():
+                decoder = VideoDecoder(video_path, use_gpu=False, logger=self.logger)
+                total_frames = len(decoder)
             
             # Sample frames
             sample_indices = range(0, total_frames, sample_rate)
             
             black_count = 0
             
+            # Suppress warnings during frame reading
             for idx in sample_indices:
-                frame = decoder[idx]
+                with suppress_stderr():
+                    frame = decoder[idx]
                 
                 # Convert to grayscale
                 if len(frame.shape) == 3:
@@ -131,6 +152,10 @@ class IntegrityChecker:
             total_sampled = len(list(sample_indices))
             black_ratio = black_count / total_sampled if total_sampled > 0 else 0.0
             
+            # Cleanup decoder
+            if hasattr(decoder, 'cap'):
+                decoder.cap.release()
+            
             self.logger.debug(
                 f"Black frame detection: {black_count}/{total_sampled} "
                 f"({black_ratio:.1%}) - {video_path}"
@@ -140,6 +165,12 @@ class IntegrityChecker:
             
         except Exception as e:
             self.logger.error(f"Black frame detection failed for {video_path}: {str(e)}")
+            # Ensure decoder is cleaned up on error
+            try:
+                if 'decoder' in locals() and hasattr(decoder, 'cap'):
+                    decoder.cap.release()
+            except:
+                pass
             return 0.0, 0, 0
     
     def validate_video(

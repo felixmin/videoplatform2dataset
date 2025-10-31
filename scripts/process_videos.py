@@ -113,6 +113,7 @@ def main():
         jpeg_quality=config.get('jpeg_quality', 85),
         enable_deduplication=config.get('enable_deduplication', False),
         entropy_percentile=config.get('entropy_percentile', 50.0),
+        num_workers=config.get('frame_workers'),
         logger=logger
     )
     
@@ -152,10 +153,27 @@ def main():
         video_id = video_meta['video_id']
         
         try:
-            # Check if already processed
-            if manifest.is_processed(video_id):
-                logger.info(f"Skipping already processed: {video_id}")
-                continue
+            # Check if already processed by looking at filesystem
+            video_name = Path(video_path).stem
+            output_dir = Path(config['output_dir'])
+            if config.get('flat_structure', False):
+                # Flat structure: check for scenes directory
+                processed_dir = output_dir / "scenes"
+                if processed_dir.exists():
+                    # Check if we have scenes for this video
+                    scene_dirs = [d for d in processed_dir.iterdir() if d.is_dir() and video_name in d.name]
+                    if scene_dirs and any((d / "frame_0000.jpg").exists() for d in scene_dirs):
+                        logger.info(f"Skipping already processed: {video_id} (frames found in {processed_dir})")
+                        continue
+            else:
+                # Hierarchical structure: check for video-specific directory
+                video_output_dir = output_dir / video_name
+                if video_output_dir.exists():
+                    # Check if we have scene directories with frames
+                    scene_dirs = [d for d in video_output_dir.iterdir() if d.is_dir() and d.name.startswith("scene_")]
+                    if scene_dirs and any((d / "frame_0000.jpg").exists() for d in scene_dirs):
+                        logger.info(f"Skipping already processed: {video_id} (frames found in {video_output_dir})")
+                        continue
             
             # Stage 2: Validate
             if not args.skip_validation:

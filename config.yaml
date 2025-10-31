@@ -23,16 +23,17 @@ min_scene_length: 15  # Minimum frames per scene
 downscale_factor: 2  # Downscale for faster detection
 
 # Frame Extraction Settings
-output_resolution: [640, 480]  # [width, height] or null for original
+output_resolution: [256, 256]  # [width, height] or null for original
 jpeg_quality: 85  # 1-100
 enable_deduplication: false  # Entropy-based frame selection
 entropy_percentile: 50.0  # Keep frames above this percentile
+frame_workers: 4  # Number of parallel workers for frame extraction (null = auto-detect)
 
 # Folder Structure
 flat_structure: false  # true = all scenes in one folder
 
 # Performance
-use_gpu: true  # Enable GPU acceleration (Decord, NVDEC)
+use_gpu: false  # Enable GPU acceleration (Decord, NVDEC)
 
 # Logging
 log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
