@@ -4,12 +4,14 @@ A production-ready video processing pipeline designed for moderate-scale deep le
 
 ## Features
 
-- **Parallel Downloads**: Download multiple videos concurrently with progress tracking
+- **Parallel Downloads**: Download multiple videos concurrently with detailed progress tracking (speed, titles, per-video status)
+- **Smart Skipping**: Automatically skips already downloaded videos and already processed videos (filesystem-based checks)
 - **Integrity Validation**: FFmpeg-based validation and black frame detection
 - **Scene Detection**: Automatic scene boundary detection using PySceneDetect
-- **Video Decoding**: Fast video frame extraction using OpenCV
+- **Video Decoding**: Fast video frame extraction using OpenCV (h264 warnings suppressed)
+- **Parallel Frame Extraction**: Multi-threaded frame extraction from multiple scenes
 - **Frame Extraction**: Extract frames from scenes with optional entropy-based deduplication
-- **Metadata Tracking**: Comprehensive manifest system for processing history
+- **Metadata Tracking**: Comprehensive manifest system for processing history (reporting/logging only)
 
 ## Installation
 
@@ -88,6 +90,10 @@ scene_threshold: 3.0
 output_resolution: [640, 480]
 jpeg_quality: 85
 enable_deduplication: false
+frame_workers: 4  # Number of parallel workers for frame extraction
+
+# Folder Structure
+flat_structure: false  # true = all scenes in one folder, false = hierarchical
 ```
 
 ## Command-Line Options
@@ -137,7 +143,7 @@ video_dataset_processor/
 
 ## Output Structure
 
-Processed frames are organized by video and scene:
+Processed frames are organized by video and scene. By default (hierarchical structure):
 
 ```
 data/processed/
@@ -151,6 +157,19 @@ data/processed/
 └── video_002/
     └── ...
 ```
+
+With `flat_structure: true`, all scenes are in a single `scenes/` folder:
+```
+data/processed/scenes/
+├── video_001_scene_000/
+├── video_001_scene_001/
+└── ...
+```
+
+## How It Works
+
+- **Automatic Resumption**: The pipeline automatically skips videos that are already downloaded (checks file existence and size) and videos that are already processed (checks for existing frame directories). No need to manually track progress.
+- **Manifest**: The `manifest.json` file is generated for reporting and logging purposes only. Processing decisions are based on filesystem checks.
 
 ## Performance
 
