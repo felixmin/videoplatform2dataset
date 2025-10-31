@@ -1,0 +1,20 @@
+# Core video processing
+yt-dlp>=2024.8.0
+decord>=0.6.0
+scenedetect[opencv]>=0.6.2
+
+# Image processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Scientific computing
+scipy>=1.10.0
+
+# Configuration and CLI
+PyYAML>=6.0
+tqdm>=4.65.0
+
+# Optional: GPU acceleration
+# pynvcodec  # Uncomment if using NVIDIA GPUs
+

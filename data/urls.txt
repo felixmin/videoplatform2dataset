@@ -1,0 +1,6 @@
+# Video URLs file
+# Add one URL per line. Lines starting with # are ignored.
+# Example:
+# https://www.youtube.com/watch?v=VIDEO_ID_1
+# https://www.youtube.com/watch?v=VIDEO_ID_2
+
