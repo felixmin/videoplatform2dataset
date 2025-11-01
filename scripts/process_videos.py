@@ -5,240 +5,196 @@ Main video processing pipeline orchestrator
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.downloader import ParallelVideoDownloader
-from src.integrity_checker import IntegrityChecker
-from src.scene_detector import SceneDetector
-from src.frame_processor import FrameProcessor
-from src.manifest_manager import ManifestManager
-from src.utils import setup_logging, load_config, format_time
+from src.utils import setup_logging, load_config
+from src.pipeline import run_pipeline
 
 
 def parse_arguments():
     """Parse command-line arguments."""
+    # Default config path relative to repo root (parent of scripts/)
+    repo_root = Path(__file__).parent.parent
+    default_config = repo_root / 'config.yaml'
+    
     parser = argparse.ArgumentParser(
         description="Video dataset processor for deep learning",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    parser.add_argument('-c', '--config', type=str, default='config.yaml',
-                       help='Configuration file path')
+    # Configuration file
+    parser.add_argument('-c', '--config', type=str, default=str(default_config),
+                       help='Default configuration file path (all settings can be overridden via CLI)')
+    
+    # Input/Output paths
     parser.add_argument('-u', '--urls-file', type=str,
-                       help='URLs file (overrides config)')
+                       help='URLs file path (overrides config)')
+    parser.add_argument('--download-dir', type=str,
+                       help='Directory to download videos to (overrides config)')
+    parser.add_argument('--output-dir', type=str,
+                       help='Directory to save processed frames (overrides config)')
+    parser.add_argument('--manifest-path', type=str,
+                       help='Path to manifest JSON file (overrides config)')
+    
+    # Download settings
+    parser.add_argument('--video-quality', type=str,
+                       help='Video quality filter (e.g., "best[height<=1080]")')
+    parser.add_argument('--max-downloads', type=int,
+                       help='Maximum number of videos to download (null = all)')
     parser.add_argument('--num-workers', type=int,
                        help='Number of parallel download workers')
+    
+    # Validation settings
+    parser.add_argument('--black-threshold', type=int,
+                       help='Pixel intensity threshold for black frames (0-255)')
+    parser.add_argument('--max-black-ratio', type=float,
+                       help='Maximum ratio of black frames before flagging (0.0-1.0)')
+    parser.add_argument('--skip-validation', action='store_true',
+                       help='Skip integrity validation (not recommended)')
+    
+    # Scene detection settings
     parser.add_argument('--no-scene-detection', action='store_true',
                        help='Disable scene detection (treat video as single scene)')
-    parser.add_argument('--enable-deduplication', action='store_true',
-                       help='Enable entropy-based frame deduplication')
+    parser.add_argument('--scene-detector', type=str, choices=['content', 'adaptive', 'threshold'],
+                       help='Scene detector type')
+    parser.add_argument('--scene-threshold', type=float,
+                       help='Scene detection threshold')
+    parser.add_argument('--min-scene-length', type=int,
+                       help='Minimum frames per scene')
+    parser.add_argument('--downscale-factor', type=int,
+                       help='Downscale factor for faster scene detection')
+    
+    # Frame extraction settings
     parser.add_argument('--resolution', type=str,
                        help='Output resolution WIDTHxHEIGHT (e.g., 640x480)')
     parser.add_argument('--jpeg-quality', type=int,
                        help='JPEG quality 1-100')
+    parser.add_argument('--enable-deduplication', action='store_true',
+                       help='Enable entropy-based frame deduplication')
+    parser.add_argument('--entropy-percentile', type=float,
+                       help='Keep frames above this entropy percentile (0.0-100.0)')
+    parser.add_argument('--frame-workers', type=int,
+                       help='Number of parallel workers for frame extraction')
+    
+    # Folder structure
+    parser.add_argument('--flat-structure', action='store_true',
+                       help='Use flat structure (all scenes in one folder)')
+    
+    # Performance
     parser.add_argument('--use-cpu', action='store_true',
-                       help='Disable GPU acceleration')
-    parser.add_argument('--skip-validation', action='store_true',
-                       help='Skip integrity validation (not recommended)')
+                       help='Disable GPU acceleration (use CPU only)')
+    
+    # Logging
+    parser.add_argument('--log-level', type=str, choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       help='Logging level')
+    parser.add_argument('--log-file', type=str,
+                       help='Log file path')
     parser.add_argument('-v', '--verbose', action='store_true',
-                       help='Verbose logging')
+                       help='Verbose logging (sets log level to DEBUG)')
     
     return parser.parse_args()
 
 
-def main():
-    """Main pipeline execution."""
-    args = parse_arguments()
+def apply_cli_overrides(args, config):
+    """
+    Apply command-line argument overrides to config dictionary.
     
-    # Load config
-    try:
-        config = load_config(args.config)
-    except FileNotFoundError:
-        print(f"Error: Config file not found: {args.config}")
-        sys.exit(1)
-    
-    # Override config with CLI args
+    Args:
+        args: Parsed command-line arguments
+        config: Configuration dictionary to modify
+    """
+    # Input/Output paths
     if args.urls_file:
         config['urls_file'] = args.urls_file
+    if args.download_dir:
+        config['download_dir'] = args.download_dir
+    if args.output_dir:
+        config['output_dir'] = args.output_dir
+    if args.manifest_path:
+        config['manifest_path'] = args.manifest_path
+    
+    # Download settings
+    if args.video_quality:
+        config['video_quality'] = args.video_quality
+    if args.max_downloads is not None:
+        config['max_downloads'] = args.max_downloads
     if args.num_workers:
         config['num_workers'] = args.num_workers
+    
+    # Validation settings
+    if args.black_threshold is not None:
+        config['black_threshold'] = args.black_threshold
+    if args.max_black_ratio is not None:
+        config['max_black_ratio'] = args.max_black_ratio
+    
+    # Scene detection settings
     if args.no_scene_detection:
         config['detect_scenes'] = False
-    if args.enable_deduplication:
-        config['enable_deduplication'] = True
+    if args.scene_detector:
+        config['scene_detector'] = args.scene_detector
+    if args.scene_threshold is not None:
+        config['scene_threshold'] = args.scene_threshold
+    if args.min_scene_length is not None:
+        config['min_scene_length'] = args.min_scene_length
+    if args.downscale_factor is not None:
+        config['downscale_factor'] = args.downscale_factor
+    
+    # Frame extraction settings
     if args.resolution:
         w, h = map(int, args.resolution.split('x'))
         config['output_resolution'] = [w, h]
     if args.jpeg_quality:
         config['jpeg_quality'] = args.jpeg_quality
+    if args.enable_deduplication:
+        config['enable_deduplication'] = True
+    if args.entropy_percentile is not None:
+        config['entropy_percentile'] = args.entropy_percentile
+    if args.frame_workers is not None:
+        config['frame_workers'] = args.frame_workers
+    
+    # Folder structure
+    if args.flat_structure:
+        config['flat_structure'] = True
+    
+    # Performance
+    if args.use_cpu:
+        config['use_gpu'] = False
+    
+    # Logging
+    if args.log_level:
+        config['log_level'] = args.log_level
+    if args.log_file:
+        config['log_file'] = args.log_file
+
+
+def main():
+    """CLI entry point for video processing pipeline."""
+    args = parse_arguments()
+    
+    # Load default config
+    try:
+        config = load_config(args.config)
+    except FileNotFoundError:
+        print(f"Error: Default config file not found: {args.config}")
+        sys.exit(1)
+    
+    # Override config with CLI args (all config values can be overridden)
+    apply_cli_overrides(args, config)
     
     # Setup logging
     log_level = "DEBUG" if args.verbose else config.get('log_level', 'INFO')
-    logger = setup_logging(config.get('log_file'), log_level)
+    setup_logging(config.get('log_file'), log_level)
     
-    logger.info("=" * 60)
-    logger.info("VIDEO DATASET PROCESSOR")
-    logger.info("=" * 60)
-    
-    start_time = time.time()
-    
-    # Initialize components
-    downloader = ParallelVideoDownloader(
-        download_dir=config['download_dir'],
-        video_quality=config['video_quality'],
-        num_workers=config.get('num_workers', 4),
-        logger=logger
+    # Run the pipeline
+    stats = run_pipeline(
+        config=config,
+        skip_validation=args.skip_validation,
+        use_cpu=args.use_cpu
     )
     
-    validator = IntegrityChecker(
-        black_threshold=config.get('black_threshold', 20),
-        max_black_ratio=config.get('max_black_ratio', 0.5),
-        logger=logger
-    )
-    
-    scene_detector = SceneDetector(
-        detector_type=config.get('scene_detector', 'adaptive'),
-        threshold=config.get('scene_threshold', 3.0),
-        min_scene_length=config.get('min_scene_length', 15),
-        downscale_factor=config.get('downscale_factor', 2),
-        logger=logger
-    ) if config.get('detect_scenes', True) else None
-    
-    frame_processor = FrameProcessor(
-        output_dir=config['output_dir'],
-        output_resolution=tuple(config['output_resolution']) if config.get('output_resolution') else None,
-        jpeg_quality=config.get('jpeg_quality', 85),
-        enable_deduplication=config.get('enable_deduplication', False),
-        entropy_percentile=config.get('entropy_percentile', 50.0),
-        num_workers=config.get('frame_workers'),
-        logger=logger
-    )
-    
-    manifest = ManifestManager(
-        manifest_path=config.get('manifest_path', 'data/manifest.json'),
-        logger=logger
-    )
-    
-    # Stage 1: Download
-    logger.info("=" * 60)
-    logger.info("STAGE 1: DOWNLOADING VIDEOS")
-    logger.info("=" * 60)
-    
-    urls = downloader.read_urls_from_file(
-        args.urls_file or config['urls_file']
-    )
-    
-    downloaded = downloader.download_videos_parallel(
-        urls,
-        max_downloads=config.get('max_downloads')
-    )
-    
-    logger.info(f"Downloaded {len(downloaded)} videos")
-    
-    # Process each video
-    stats = {
-        'downloaded': len(downloaded),
-        'validated': 0,
-        'processed': 0,
-        'total_scenes': 0,
-        'total_frames': 0,
-        'failed': 0
-    }
-    
-    for video_meta in downloaded:
-        video_path = video_meta['filepath']
-        video_id = video_meta['video_id']
-        
-        try:
-            # Check if already processed by looking at filesystem
-            video_name = Path(video_path).stem
-            output_dir = Path(config['output_dir'])
-            if config.get('flat_structure', False):
-                # Flat structure: check for scenes directory
-                processed_dir = output_dir / "scenes"
-                if processed_dir.exists():
-                    # Check if we have scenes for this video
-                    scene_dirs = [d for d in processed_dir.iterdir() if d.is_dir() and video_name in d.name]
-                    if scene_dirs and any((d / "frame_0000.jpg").exists() for d in scene_dirs):
-                        logger.info(f"Skipping already processed: {video_id} (frames found in {processed_dir})")
-                        continue
-            else:
-                # Hierarchical structure: check for video-specific directory
-                video_output_dir = output_dir / video_name
-                if video_output_dir.exists():
-                    # Check if we have scene directories with frames
-                    scene_dirs = [d for d in video_output_dir.iterdir() if d.is_dir() and d.name.startswith("scene_")]
-                    if scene_dirs and any((d / "frame_0000.jpg").exists() for d in scene_dirs):
-                        logger.info(f"Skipping already processed: {video_id} (frames found in {video_output_dir})")
-                        continue
-            
-            # Stage 2: Validate
-            if not args.skip_validation:
-                logger.info(f"Validating: {video_id}")
-                validation = validator.validate_video(video_path)
-                
-                if not validation['is_valid']:
-                    logger.warning(f"Video failed validation: {video_id}")
-                    manifest.add_video(video_id, video_meta, validation, [])
-                    stats['failed'] += 1
-                    continue
-                
-                stats['validated'] += 1
-            else:
-                validation = {'is_valid': True, 'skipped': True}
-            
-            # Stage 3: Scene Detection
-            if scene_detector:
-                logger.info(f"Detecting scenes: {video_id}")
-                scenes = scene_detector.detect_scenes(video_path, show_progress=False)
-            else:
-                # Treat entire video as one scene
-                from src.video_decoder import VideoDecoder
-                decoder = VideoDecoder(video_path, use_gpu=not args.use_cpu)
-                scenes = [(0, decoder.num_frames)]
-            
-            stats['total_scenes'] += len(scenes)
-            
-            # Stage 4: Frame Extraction
-            logger.info(f"Extracting frames: {video_id}")
-            scene_metadata = frame_processor.process_video(
-                video_path,
-                scenes,
-                flat_structure=config.get('flat_structure', False),
-                use_gpu=not args.use_cpu
-            )
-            
-            frames_extracted = sum(s['saved_frames'] for s in scene_metadata)
-            stats['total_frames'] += frames_extracted
-            stats['processed'] += 1
-            
-            # Update manifest
-            manifest.add_video(video_id, video_meta, validation, scene_metadata)
-            manifest.save()
-            
-        except Exception as e:
-            logger.error(f"Failed to process {video_id}: {str(e)}", exc_info=True)
-            stats['failed'] += 1
-    
-    # Summary
-    elapsed = time.time() - start_time
-    
-    logger.info("=" * 60)
-    logger.info("PROCESSING COMPLETE")
-    logger.info("=" * 60)
-    logger.info(f"Videos downloaded:  {stats['downloaded']}")
-    logger.info(f"Videos validated:   {stats['validated']}")
-    logger.info(f"Videos processed:   {stats['processed']}")
-    logger.info(f"Total scenes:       {stats['total_scenes']}")
-    logger.info(f"Total frames:       {stats['total_frames']}")
-    logger.info(f"Failed:             {stats['failed']}")
-    logger.info(f"Total time:         {format_time(elapsed)}")
-    logger.info("=" * 60)
-    
-    sys.exit(0 if stats['failed'] == 0 else 1)
+    sys.exit(stats['exit_code'])
 
 
 if __name__ == '__main__':

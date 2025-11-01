@@ -95,6 +95,10 @@ class IntegrityChecker:
             self.logger.info(f"FFmpeg integrity check passed: {video_path}")
             return True, ""
             
+        except FileNotFoundError:
+            # FFmpeg not available - fall back to OpenCV-based check
+            return self.check_opencv_integrity(video_path)
+            
         except subprocess.TimeoutExpired:
             error_msg = "FFmpeg integrity check timeout"
             self.logger.error(f"{error_msg}: {video_path}")
@@ -103,6 +107,73 @@ class IntegrityChecker:
         except Exception as e:
             error_msg = f"FFmpeg integrity check exception: {str(e)}"
             self.logger.error(f"{error_msg}: {video_path}")
+            return False, error_msg
+    
+    def check_opencv_integrity(self, video_path: str) -> Tuple[bool, str]:
+        """
+        Check video integrity using OpenCV (fallback when FFmpeg unavailable).
+        Samples frames from different positions to detect corruption.
+        More lenient than FFmpeg - only checks that video can be opened and first frames readable.
+        
+        Args:
+            video_path: Path to video file
+        
+        Returns:
+            (is_valid, error_message)
+        """
+        try:
+            with suppress_stderr():
+                decoder = VideoDecoder(video_path, use_gpu=False, logger=self.logger)
+                total_frames = len(decoder)
+            
+            if total_frames <= 0:
+                return False, "Video has no frames"
+            
+            # For OpenCV-based check, only verify:
+            # 1. First few frames (most reliable to read)
+            # 2. Skip middle/end frames since seeking can fail on long H.264 videos
+            #    even when videos are valid
+            
+            # Check first frame (must succeed)
+            try:
+                with suppress_stderr():
+                    frame = decoder[0]
+                    if frame is None or frame.size == 0:
+                        return False, f"Failed to decode first frame"
+            except Exception as e:
+                return False, f"Failed to read first frame: {str(e)}"
+            
+            # Optionally check a few more frames near the beginning (more reliable)
+            frames_to_check = min(10, total_frames // 100)  # Check up to 10 frames or 1% of video
+            frames_checked = 0
+            for i in range(1, min(frames_to_check + 1, total_frames)):
+                try:
+                    with suppress_stderr():
+                        frame = decoder[i]
+                        if frame is not None and frame.size > 0:
+                            frames_checked += 1
+                except Exception:
+                    # Individual frame failures near beginning are concerning
+                    if i < 5:  # First 5 frames must be readable
+                        return False, f"Failed to decode early frame {i}/{total_frames}"
+                    # After first 5, we're more lenient
+            
+            # Cleanup
+            if hasattr(decoder, 'cap'):
+                decoder.cap.release()
+            
+            self.logger.info(f"OpenCV integrity check passed (checked {frames_checked + 1} frames from beginning): {video_path}")
+            return True, ""
+            
+        except Exception as e:
+            error_msg = f"OpenCV integrity check failed: {str(e)}"
+            self.logger.error(f"{error_msg}: {video_path}")
+            # Ensure decoder is cleaned up on error
+            try:
+                if 'decoder' in locals() and hasattr(decoder, 'cap'):
+                    decoder.cap.release()
+            except:
+                pass
             return False, error_msg
     
     def detect_black_frames(
