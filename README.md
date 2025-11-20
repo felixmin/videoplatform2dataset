@@ -8,9 +8,9 @@ A production-ready video processing pipeline designed for moderate-scale deep le
 - **Smart Skipping**: Automatically skips already downloaded videos and already processed videos (filesystem-based checks)
 - **Integrity Validation**: FFmpeg-based validation (optional, with OpenCV fallback) and black frame detection
 - **Scene Detection**: Automatic scene boundary detection using PySceneDetect
-- **Video Decoding**: Fast video frame extraction using OpenCV (h264 warnings suppressed)
+- **Fast Frame Extraction**: FFmpeg-based batch frame extraction with GPU acceleration support (5-10x faster than OpenCV)
 - **Parallel Frame Extraction**: Multi-threaded frame extraction from multiple scenes
-- **Frame Extraction**: Extract frames from scenes with optional entropy-based deduplication
+- **GPU Acceleration**: Optional NVIDIA GPU acceleration via FFmpeg NVDEC for H.264 decoding and scaling
 - **Metadata Tracking**: Comprehensive manifest system for processing history (reporting/logging only)
 
 ## Installation
@@ -18,7 +18,7 @@ A production-ready video processing pipeline designed for moderate-scale deep le
 ### Prerequisites
 
 - Python 3.10+ (CPython) or 3.11+ (PyPy)
-- FFmpeg (optional, for enhanced video validation - OpenCV fallback available)
+- FFmpeg (required for frame extraction, optional for validation - OpenCV fallback available)
 
 ### Install Dependencies
 
@@ -26,7 +26,7 @@ A production-ready video processing pipeline designed for moderate-scale deep le
 # Install Python dependencies
 pip install -r requirements.txt
 
-# FFmpeg (optional but recommended for better validation)
+# FFmpeg (required for frame extraction)
 # Ubuntu/Debian:
 sudo apt-get install ffmpeg
 
@@ -35,6 +35,11 @@ brew install ffmpeg
 
 # Windows:
 # Download from https://ffmpeg.org/download.html
+
+# For GPU acceleration (optional):
+# Requires NVIDIA GPU with NVDEC support and FFmpeg compiled with CUDA
+# Most pre-built FFmpeg packages don't include CUDA support
+# Use NVIDIA's container images or compile FFmpeg with --enable-cuda
 ```
 
 
@@ -63,8 +68,8 @@ python scripts/process_videos.py
 # With custom default config
 python scripts/process_videos.py -c my_config.yaml
 
-# Override specific settings via CLI
-python scripts/process_videos.py --num-workers 8 --enable-deduplication --output-dir /path/to/output
+  # Override specific settings via CLI
+  python scripts/process_videos.py --num-workers 8 --output-dir /path/to/output
 
 # Override input URLs and output directory
 python scripts/process_videos.py -u /path/to/urls.txt --output-dir /path/to/output
@@ -90,10 +95,9 @@ scene_detector: "adaptive"
 scene_threshold: 3.0
 
 # Frame Extraction
-output_resolution: [640, 480]
-jpeg_quality: 85
-enable_deduplication: false
-frame_workers: 4  # Number of parallel workers for frame extraction
+output_resolution: [256, 256]
+jpeg_quality: 75
+frame_workers: null  # Number of parallel workers (null = auto-detect, typically 4)
 
 # Folder Structure
 flat_structure: false  # true = all scenes in one folder, false = hierarchical
@@ -133,17 +137,15 @@ Scene Detection:
   --downscale-factor N       Downscale factor for faster detection
 
 Frame Extraction:
-  --resolution WIDTHxHEIGHT    Output resolution (e.g., 640x480)
-  --jpeg-quality N            JPEG quality 1-100
-  --enable-deduplication      Enable entropy-based frame deduplication
-  --entropy-percentile FLOAT  Keep frames above this entropy percentile (0.0-100.0)
+  --resolution WIDTHxHEIGHT    Output resolution (e.g., 256x256)
+  --jpeg-quality N            JPEG quality 1-100 (default: 75)
   --frame-workers N           Number of parallel workers for frame extraction
 
 Folder Structure:
   --flat-structure            Use flat structure (all scenes in one folder)
 
 Performance:
-  --use-cpu                   Use CPU instead of GPU (currently uses CPU decoding)
+  --use-cpu                   Disable GPU acceleration (use CPU-only FFmpeg)
 
 Logging:
   --log-level LEVEL           Logging level (DEBUG, INFO, WARNING, ERROR)
@@ -159,6 +161,9 @@ Examples:
   
   # Custom resolution and quality
   python scripts/process_videos.py --resolution 512x512 --jpeg-quality 90
+  
+  # Use CPU-only (disable GPU acceleration)
+  python scripts/process_videos.py --use-cpu
 ```
 
 ## Project Structure
@@ -172,9 +177,10 @@ video_dataset_processor/
 │   ├── __init__.py
 │   ├── downloader.py          # Parallel video downloads
 │   ├── integrity_checker.py   # Video validation (FFmpeg + OpenCV)
-│   ├── video_decoder.py       # OpenCV-based video decoding
+│   ├── video_decoder.py       # OpenCV-based video decoding (used for scene detection fallback)
 │   ├── scene_detector.py      # Scene detection
-│   ├── frame_processor.py     # Frame extraction
+│   ├── frame_processor.py     # OpenCV-based frame extraction (legacy)
+│   ├── frame_processor_ffmpeg.py  # FFmpeg-based frame extraction (current, faster)
 │   ├── manifest_manager.py    # Metadata tracking
 │   ├── pipeline.py            # Core pipeline orchestration
 │   └── utils.py               # Shared utilities
@@ -223,13 +229,15 @@ data/processed/scenes/
 
 For **20 videos × 1.5 hours** (30 hours total):
 
-| Stage | Time Estimate |
-|-------|--------------|
-| Download (4 workers) | 2-6 hours |
-| Validation | 30-60 minutes |
-| Scene Detection | 15-30 minutes |
-| Frame Extraction | 2-4 hours |
-| **Total** | **4-10 hours** |
+| Stage | Time Estimate (CPU) | Time Estimate (GPU) |
+|-------|---------------------|---------------------|
+| Download (4 workers) | 2-6 hours | 2-6 hours |
+| Validation (if enabled) | 30-60 minutes | 30-60 minutes |
+| Scene Detection | 15-30 minutes | 15-30 minutes |
+| Frame Extraction | 1-3 hours (FFmpeg CPU) | 15-45 minutes (FFmpeg GPU) |
+| **Total** | **3-9 hours** | **2-7 hours** |
+
+**Note**: Frame extraction uses FFmpeg batch processing (5-10x faster than OpenCV). GPU acceleration provides additional 3-5x speedup when available.
 
 ## Hardware Recommendations
 
@@ -253,13 +261,15 @@ conda install -c conda-forge opencv
 
 ### FFmpeg not found
 
-FFmpeg is optional. If not installed, the pipeline will use OpenCV-based integrity checking (less comprehensive but still functional). To enable FFmpeg validation, install it using your system package manager (see Installation section).
+FFmpeg is **required** for frame extraction. The pipeline uses FFmpeg for fast batch frame extraction. If FFmpeg is not installed, frame extraction will fail. Install FFmpeg using your system package manager (see Installation section).
+
+For validation, FFmpeg is optional - the pipeline will use OpenCV-based integrity checking as a fallback.
 
 ### Out of memory
 
-- Reduce `num_workers` in config
+- Reduce `num_workers` or `frame_workers` in config
 - Lower `output_resolution`
-- Enable `enable_deduplication` to reduce frame count
+- Reduce `jpeg_quality` to decrease memory usage during encoding
 
 ## License
 
@@ -279,7 +289,8 @@ This is a production-ready implementation. For improvements:
 
 Built with:
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) - Video downloading
-- [OpenCV](https://opencv.org/) - Video decoding and processing
+- [FFmpeg](https://ffmpeg.org/) - Fast batch frame extraction with GPU acceleration
+- [OpenCV](https://opencv.org/) - Video decoding (for scene detection fallback and validation)
 - [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) - Scene detection
 - [Pillow](https://python-pillow.org/) - Image processing
 
