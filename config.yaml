@@ -1,41 +1,230 @@
 # Video Dataset Processor Configuration
+# All settings can be overridden via CLI arguments (see README.md or --help)
 
-# Input/Output
+# ============================================================
+# INPUT/OUTPUT PATHS
+# ============================================================
+
+# urls_file: Path to text file containing video URLs (one per line)
+# Used by: ParallelVideoDownloader (src/downloader.py)
+# Examples: "data/urls.txt", "my_videos.txt", "/path/to/urls.txt"
 urls_file: "data/urls.txt"
+
+# download_dir: Directory where raw videos are saved
+# Used by: ParallelVideoDownloader (src/downloader.py)
+# Videos saved as: {download_dir}/{video_id}.mp4
 download_dir: "data/raw"
+
+# output_dir: Root directory for processed frames
+# Used by: FrameProcessorFFmpeg (src/frame_processor_ffmpeg.py)
+# Structure: {output_dir}/{video_name}/scene_{N}/frame_{M}.jpg
 output_dir: "data/processed"
+
+# manifest_path: JSON file tracking processing metadata (for reporting only)
+# Used by: ManifestManager (src/manifest_manager.py)
+# Note: Processing decisions based on filesystem, not manifest
 manifest_path: "data/manifest.json"
 
-# Download Settings
+
+# ============================================================
+# DOWNLOAD SETTINGS
+# ============================================================
+
+# video_quality: yt-dlp format selector for video quality
+# Used by: ParallelVideoDownloader (src/downloader.py)
+# Examples:
+#   "best[height<=1080]" - Max 1080p (recommended for most datasets)
+#   "best[height<=720]"  - Max 720p (smaller files, faster downloads)
+#   "best[height<=480]"  - Max 480p (very fast, lower quality)
+#   "bestvideo+bestaudio" - Highest quality available
+# See: https://github.com/yt-dlp/yt-dlp#format-selection
 video_quality: "best[height<=1080]"
-max_downloads: null  # null = all videos
-num_workers: 4  # Parallel download workers
 
-# Validation Settings
-black_threshold: 20  # Pixel intensity threshold for black frames
-max_black_ratio: 0.5  # Max ratio of black frames before flagging
+# max_downloads: Maximum number of videos to download (null = all)
+# Used by: ParallelVideoDownloader (src/downloader.py)
+# Examples: null (all), 10 (first 10), 100 (limit to 100)
+# Useful for: Testing pipeline on subset before full run
+max_downloads: null
 
-# Scene Detection Settings
+# num_workers: Number of parallel download processes
+# Used by: ParallelVideoDownloader via multiprocessing.Pool (src/downloader.py)
+# Trade-off: More workers = faster downloads but more network/CPU load
+# Examples:
+#   2 - Conservative (slow connection or shared network)
+#   4 - Balanced (recommended for most cases)
+#   8 - Aggressive (fast connection, dedicated machine)
+# Note: Limited by network bandwidth, not CPU
+num_workers: 4
+
+
+# ============================================================
+# VALIDATION SETTINGS
+# ============================================================
+# Used by: IntegrityChecker (src/integrity_checker.py)
+# Can be skipped entirely with --skip-validation flag (recommended for YouTube)
+
+# black_threshold: Pixel intensity below this is considered "black" (0-255)
+# Used by: IntegrityChecker.check_black_frames() (src/integrity_checker.py:184)
+# Examples:
+#   10 - Very strict (only pure black)
+#   20 - Balanced (default, catches dark frames)
+#   30 - Lenient (allows darker content)
+black_threshold: 20
+
+# max_black_ratio: Max ratio of black frames before flagging video as invalid (0.0-1.0)
+# Used by: IntegrityChecker.validate_video() (src/integrity_checker.py:208)
+# Examples:
+#   0.3 - Strict (30% black frames triggers warning)
+#   0.5 - Balanced (default)
+#   0.8 - Lenient (allows videos with fade-to-black transitions)
+max_black_ratio: 0.5
+
+
+# ============================================================
+# SCENE DETECTION SETTINGS
+# ============================================================
+# Used by: SceneDetector (src/scene_detector.py) via PySceneDetect
+# Disable with: --no-scene-detection (treats entire video as one scene)
+
+# detect_scenes: Enable/disable scene boundary detection
+# Used by: Pipeline (src/pipeline.py:160)
+# true  - Split video into scenes based on content changes
+# false - Treat entire video as single scene (faster, simpler)
 detect_scenes: true
-scene_detector: "adaptive"  # "content", "adaptive", or "threshold"
-scene_threshold: 3.0  # For adaptive detector
-min_scene_length: 15  # Minimum frames per scene
-downscale_factor: 2  # Downscale for faster detection
 
-# Frame Extraction Settings
-output_resolution: [256, 256]  # [width, height] or null for original
-jpeg_quality: 85  # 1-100
-enable_deduplication: false  # Entropy-based frame selection
-entropy_percentile: 50.0  # Keep frames above this percentile
-frame_workers: 4  # Number of parallel workers for frame extraction (null = auto-detect)
+# scene_detector: Algorithm for detecting scene changes
+# Used by: SceneDetector._create_detector() (src/scene_detector.py:45)
+# Options:
+#   "adaptive"  - Best for most videos (adapts to content, recommended)
+#   "content"   - Fixed threshold, good for consistent lighting
+#   "threshold" - Simple luminance-based detection (fastest but less accurate)
+scene_detector: "adaptive"
 
-# Folder Structure
-flat_structure: false  # true = all scenes in one folder
+# scene_threshold: Sensitivity threshold for scene detection
+# Used by: SceneDetector._create_detector() (src/scene_detector.py:48-60)
+# Higher = fewer scene cuts (only major changes), Lower = more scene cuts
+# Examples:
+#   1.0-2.0 - Sensitive (many scene cuts, good for fast-paced content)
+#   3.0     - Balanced (default, works for most videos)
+#   5.0-10.0 - Conservative (only major scene changes)
+# Note: Meaning varies by detector type
+scene_threshold: 3.0
 
-# Performance
-use_gpu: false  # Enable GPU acceleration (Decord, NVDEC)
+# min_scene_length: Minimum number of frames per scene
+# Used by: SceneDetector._create_detector() (src/scene_detector.py:48-60)
+# Prevents very short scenes from rapid cuts or flickers
+# Examples:
+#   10 - Allow short scenes (0.3s at 30fps)
+#   15 - Balanced (0.5s at 30fps, default)
+#   30 - Longer scenes only (1s at 30fps)
+min_scene_length: 15
 
-# Logging
-log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+# downscale_factor: Downscale video resolution for faster scene detection
+# Used by: SceneDetector.detect_scenes() (src/scene_detector.py:94)
+# Trade-off: Higher = faster but may miss subtle scene changes
+# Examples:
+#   1 - No downscaling (slowest, most accurate)
+#   2 - Balanced (recommended, 2x faster, minimal accuracy loss)
+#   4 - Fast (4x faster, may miss some scenes)
+#   8 - Very fast (8x faster, may miss many scenes - not recommended)
+# Note: If 0 scenes detected, pipeline auto-falls back to single scene
+downscale_factor: 2
+
+
+# ============================================================
+# FRAME EXTRACTION SETTINGS
+# ============================================================
+# Used by: FrameProcessorFFmpeg (src/frame_processor_ffmpeg.py)
+
+# output_resolution: Resize frames to [width, height] or null for original size
+# Used by: FrameProcessorFFmpeg via FFmpeg scale filter (src/frame_processor_ffmpeg.py:114-120)
+# Examples:
+#   [256, 256] - Small (fast, good for most ML models)
+#   [512, 512] - Medium (balanced)
+#   [640, 480] - Medium (4:3 aspect ratio)
+#   null       - Original video resolution (slower, larger files)
+# Note: Aspect ratio is not preserved, frames are stretched to fit
+output_resolution: [256, 256]
+
+# jpeg_quality: JPEG compression quality (1-100, higher = better quality)
+# Used by: FrameProcessorFFmpeg via FFmpeg qscale (src/frame_processor_ffmpeg.py:127)
+# Trade-off: Higher = better quality but larger files and slower encoding
+# Examples:
+#   50-60 - Low quality (small files, visible artifacts)
+#   75    - Balanced (default, imperceptible loss for most content)
+#   85-90 - High quality (slightly larger files, minimal loss)
+#   95+   - Very high quality (large files, diminishing returns)
+jpeg_quality: 75
+
+# enable_deduplication: Use entropy-based filtering to remove similar frames
+# Used by: FrameProcessor (src/frame_processor.py:297) - NOT used in FFmpeg version
+# Note: Currently not implemented in FrameProcessorFFmpeg (always false)
+# When enabled (in OpenCV version): Keeps only frames above entropy_percentile
+enable_deduplication: true
+
+# entropy_percentile: Percentile threshold for entropy-based deduplication (0-100)
+# Used by: FrameProcessor when enable_deduplication=true (src/frame_processor.py)
+# Note: Only relevant if using OpenCV-based FrameProcessor
+# Examples: 50.0 = keep top 50% most informative frames
+entropy_percentile: 50.0
+
+# frame_workers: Number of parallel workers for frame extraction (null = auto-detect)
+# Used by: FrameProcessorFFmpeg via ThreadPoolExecutor (src/frame_processor_ffmpeg.py:46)
+# Trade-off: More workers = faster but more I/O contention
+# Examples:
+#   null - Auto (min(4, cpu_count), recommended)
+#   2    - Conservative (slow storage or many concurrent jobs)
+#   4    - Balanced (good for most systems)
+#   8    - Aggressive (fast SSD, high-end CPU)
+# Note: Threading-based (not multiprocessing), limited by I/O not CPU
+frame_workers: null
+
+
+# ============================================================
+# OUTPUT STRUCTURE
+# ============================================================
+
+# flat_structure: Organize output scenes in flat vs hierarchical structure
+# Used by: FrameProcessorFFmpeg.process_scene() (src/frame_processor_ffmpeg.py:198)
+# false - Hierarchical: {output_dir}/{video_name}/scene_{N}/frame_{M}.jpg
+# true  - Flat:         {output_dir}/scenes/{video_name}_scene_{N}/frame_{M}.jpg
+# Flat is better for: Large datasets where filesystem has directory limits
+# Hierarchical is better for: Browsing/organizing by video
+flat_structure: false
+
+
+# ============================================================
+# PERFORMANCE
+# ============================================================
+
+# use_gpu: Enable GPU-accelerated decoding via FFmpeg NVDEC
+# Used by: FrameProcessorFFmpeg._extract_scene_with_ffmpeg() (src/frame_processor_ffmpeg.py:100)
+# Requires: NVIDIA GPU with NVDEC support + FFmpeg with CUDA support
+# Speedup: 3-5x faster frame extraction vs CPU-only
+# Behavior:
+#   true  - Try GPU first, auto-fall back to CPU on error (recommended)
+#   false - CPU-only (more compatible, slower)
+# Note: GPU failures are logged but do not stop processing
+# Override with: --use-cpu flag to force CPU-only
+use_gpu: true
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+# log_level: Minimum severity level for log messages
+# Used by: utils.setup_logging() (src/utils.py)
+# Options: "DEBUG", "INFO", "WARNING", "ERROR"
+# DEBUG   - Verbose (shows all operations, useful for troubleshooting)
+# INFO    - Normal (shows progress and important events, recommended)
+# WARNING - Quiet (only shows issues)
+# ERROR   - Silent (only shows failures)
+# Override with: -v or --verbose flag (sets to DEBUG)
+log_level: "INFO"
+
+# log_file: Path to log file (null = no file logging, only console)
+# Used by: utils.setup_logging() (src/utils.py)
+# Examples: "logs/processing.log", "output.log", null
 log_file: "logs/processing.log"
 

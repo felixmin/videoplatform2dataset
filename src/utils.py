@@ -47,21 +47,22 @@ def sanitize_filename(filename: str) -> str:
 
 def setup_logging(log_file: Optional[str] = None, level: str = 'INFO') -> logging.Logger:
     """
-    Setup logging configuration.
-    
+    Setup logging configuration for root logger (applies to all modules).
+
     Args:
         log_file: Path to log file (optional)
         level: Log level (DEBUG, INFO, WARNING, ERROR)
-    
+
     Returns:
-        Logger instance
+        Root logger instance
     """
-    logger = logging.getLogger('video_dataset_processor')
+    # Configure root logger so all module loggers inherit the handlers
+    logger = logging.getLogger()
     logger.setLevel(getattr(logging, level.upper()))
-    
-    # Remove existing handlers
+
+    # Remove existing handlers to avoid duplicates
     logger.handlers = []
-    
+
     # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(getattr(logging, level.upper()))
@@ -71,7 +72,7 @@ def setup_logging(log_file: Optional[str] = None, level: str = 'INFO') -> loggin
     )
     console_handler.setFormatter(console_format)
     logger.addHandler(console_handler)
-    
+
     # File handler (if specified)
     if log_file:
         log_path = Path(log_file)
@@ -84,7 +85,7 @@ def setup_logging(log_file: Optional[str] = None, level: str = 'INFO') -> loggin
         )
         file_handler.setFormatter(file_format)
         logger.addHandler(file_handler)
-    
+
     return logger
 
 
