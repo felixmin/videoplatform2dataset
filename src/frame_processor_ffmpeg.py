@@ -1,18 +1,13 @@
 """
 ABOUTME: FFmpeg-based frame extraction for faster video processing
-ABOUTME: Replaces OpenCV with FFmpeg batch extraction, ~5-10x speedup
+ABOUTME: Uses single-pass FFmpeg with filter_complex to extract all scenes at once
 """
 
-import os
 import logging
 import subprocess
 import time
-import numpy as np
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
-from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from multiprocessing import cpu_count
 
 from .utils import ensure_dir
 
@@ -20,7 +15,11 @@ from .utils import ensure_dir
 class FrameProcessorFFmpeg:
     """
     Extract and process frames from video scenes using FFmpeg.
-    Much faster than OpenCV due to batch extraction and less memory copying.
+    
+    New design:
+    - Single FFmpeg invocation per video
+    - Uses filter_complex: [0:v]scale?,split -> per-scene select -> per-scene outputs
+    - No temp all_frames folder, no hardlinks, no per-scene ffmpeg calls
     """
     
     def __init__(
@@ -28,8 +27,7 @@ class FrameProcessorFFmpeg:
         output_dir: str = "data/processed",
         output_resolution: Optional[Tuple[int, int]] = None,
         jpeg_quality: int = 85,
-        num_workers: Optional[int] = None,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
     ):
         """
         Initialize FFmpeg frame processor.
@@ -38,474 +36,449 @@ class FrameProcessorFFmpeg:
             output_dir: Output directory
             output_resolution: Target (width, height) or None
             jpeg_quality: JPEG quality (1-100)
-            num_workers: Number of parallel workers (None = auto-detect)
             logger: Logger instance
         """
         self.output_dir = ensure_dir(output_dir)
         self.output_resolution = output_resolution
         self.jpeg_quality = jpeg_quality
-        # Default to 8 workers (increased from 4 for better parallelism)
-        self.num_workers = num_workers or min(8, cpu_count())
         self.logger = logger or logging.getLogger(__name__)
         
-        # Track GPU usage statistics
+        # GPU / profiling stats
+        self.ffmpeg_supports_cuda = False
         self.gpu_attempts = 0
         self.gpu_successes = 0
         self.gpu_failures = 0
         self.cpu_fallbacks = 0
+        self.profiling_data: List[Dict] = []
         
-        # Track profiling statistics
-        self.profiling_data = []  # List of (wall_time, cpu_time, frame_count, scene_size)
-        
-        # Check FFmpeg availability
         self._check_ffmpeg()
     
     def _check_ffmpeg(self):
-        """Verify FFmpeg is installed and accessible."""
+        """Verify FFmpeg is installed and check for CUDA/NVENC support."""
         try:
-            result = subprocess.run(
-                ['ffmpeg', '-version'],
+            subprocess.run(
+                ["ffmpeg", "-version"],
                 capture_output=True,
-                timeout=5
+                timeout=5,
+                check=True,
             )
-            if result.returncode != 0:
-                raise RuntimeError("FFmpeg returned non-zero exit code")
             self.logger.debug("FFmpeg is available")
             
-            # Check if FFmpeg supports CUDA (optional, for GPU acceleration)
-            version_output = result.stdout.decode('utf-8', errors='ignore').lower()
-            self.ffmpeg_supports_cuda = 'cuda' in version_output or 'nvenc' in version_output
-            if not self.ffmpeg_supports_cuda:
-                self.logger.debug("FFmpeg does not appear to have CUDA support compiled in")
+            cuda_check = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True,
+                timeout=5,
+                text=True,
+            )
+            out = cuda_check.stdout
+            if "h264_nvenc" in out or "hevc_nvenc" in out:
+                self.ffmpeg_supports_cuda = True
+                self.logger.debug(
+                    "FFmpeg has NVIDIA NVENC/NVDEC (CUDA) support compiled in."
+                )
+            else:
+                self.ffmpeg_supports_cuda = False
+                self.logger.debug(
+                    "FFmpeg does not appear to have CUDA (NVENC) support compiled in."
+                )
         except FileNotFoundError:
-            raise RuntimeError("FFmpeg not found. Please install it: apt-get install ffmpeg")
+            raise RuntimeError(
+                "FFmpeg not found. Please install it, e.g. `apt-get install ffmpeg`."
+            )
+        except subprocess.CalledProcessError as e:
+            msg = (e.stderr or b"").decode("utf-8", errors="ignore")
+            raise RuntimeError(f"FFmpeg version check failed: {msg}")
         except Exception as e:
             raise RuntimeError(f"FFmpeg check failed: {str(e)}")
     
-    def _extract_scene_with_ffmpeg(
+    # ----------------- core single-pass logic -----------------
+    
+    def _build_scene_dirs(
+        self,
+        video_name: str,
+        scenes: List[Tuple[int, int]],
+        flat_structure: bool,
+    ) -> List[Path]:
+        """Create and return per-scene output directories."""
+        scene_dirs: List[Path] = []
+        for scene_idx, _ in enumerate(scenes):
+            if flat_structure:
+                scene_dir = (
+                    self.output_dir / "scenes" / f"{video_name}_scene_{scene_idx:03d}"
+                )
+            else:
+                scene_dir = (
+                    self.output_dir / video_name / f"scene_{scene_idx:03d}"
+                )
+            ensure_dir(scene_dir)
+            scene_dirs.append(scene_dir)
+        return scene_dirs
+    
+    def _build_filter_complex(
+        self,
+        scenes: List[Tuple[int, int]],
+        resolution: Optional[Tuple[int, int]],
+        use_gpu_scale: bool,
+    ) -> str:
+        """
+        Build filter_complex graph:
+        - optional scale/scale_cuda
+        - split=N
+        - per-branch select='between(n, start, end-1)'
+        
+        Produces labels [o0], [o1], ... for each scene.
+        
+        Note: Assumes all scenes are valid (end > start). Invalid scenes should be
+        filtered out before calling this method.
+        """
+        n_scenes = len(scenes)
+        parts = []
+        
+        # Input -> scale? -> split
+        if resolution is not None:
+            w, h = resolution
+            scale_name = "scale_cuda" if use_gpu_scale else "scale"
+            # [0:v]scale=WxH,split=N[v0][v1]...[vN-1]
+            split_outputs = "".join(f"[v{i}]" for i in range(n_scenes))
+            parts.append(
+                f"[0:v]{scale_name}={w}:{h},split={n_scenes}{split_outputs}"
+            )
+        else:
+            # [0:v]split=N[v0][v1]...[vN-1]
+            split_outputs = "".join(f"[v{i}]" for i in range(n_scenes))
+            parts.append(f"[0:v]split={n_scenes}{split_outputs}")
+        
+        # Per-scene select
+        for i, (start, end) in enumerate(scenes):
+            # end_frame is exclusive – use end-1 in between(n, start, end-1)
+            parts.append(
+                f"[v{i}]select='between(n,{start},{end-1})'[o{i}]"
+            )
+        
+        return ";".join(parts)
+    
+    def _run_ffmpeg_single_pass(
         self,
         video_path: str,
-        start_frame: int,
-        end_frame: int,
-        output_dir: Path,
-        resolution: Optional[Tuple[int, int]] = None,
-        quality: int = 85,
-        use_gpu: bool = True
-    ) -> int:
+        scenes: List[Tuple[int, int]],
+        scene_dirs: List[Path],
+        use_gpu: bool,
+    ) -> List[Dict]:
         """
-        Extract frames from a scene using FFmpeg (with optional GPU acceleration).
+        Run a single FFmpeg process with filter_complex to extract all scenes.
         
-        Args:
-            video_path: Path to video file
-            start_frame: Start frame index (inclusive)
-            end_frame: End frame index (exclusive)
-            output_dir: Directory to save frames
-            resolution: Target (width, height) or None
-            quality: JPEG quality (1-100)
-            use_gpu: Use GPU-accelerated decoding if available
-        
-        Returns:
-            Number of frames extracted
+        Returns per-scene metadata list.
         """
-        ensure_dir(output_dir)
+        video_name = Path(video_path).stem
+        n_scenes = len(scenes)
         
-        # Build FFmpeg command with GPU support
-        cmd = ['ffmpeg']
+        if n_scenes == 0:
+            self.logger.warning(f"No scenes provided for {video_name}")
+            return []
+        
+        # Base cmd
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
         gpu_enabled = False
         
-        # Add GPU hardware acceleration if requested
-        if use_gpu:
-            # Check if FFmpeg supports CUDA before attempting
-            if not getattr(self, 'ffmpeg_supports_cuda', False):
-                self.logger.debug(
-                    f"GPU requested but FFmpeg doesn't support CUDA, using CPU for scene [{start_frame}-{end_frame}]"
-                )
-                gpu_enabled = False
-            else:
-                self.gpu_attempts += 1
-                # Try NVIDIA NVDEC (H.264 supported on most NVIDIA GPUs)
-                cmd.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
-                gpu_enabled = True
-                self.logger.debug(f"Attempting GPU acceleration for scene [{start_frame}-{end_frame}]")
-        else:
-            # Log when CPU is used directly (not as fallback)
-            self.logger.debug(f"Using CPU-only FFmpeg for scene [{start_frame}-{end_frame}]")
+        # Hardware acceleration (decode)
+        if use_gpu and self.ffmpeg_supports_cuda:
+            self.gpu_attempts += 1
+            cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+            gpu_enabled = True
+            self.logger.debug(
+                f"Attempting GPU acceleration for {video_name} (single-pass)"
+            )
+        elif use_gpu:
+            self.logger.debug(
+                f"GPU requested but FFmpeg lacks CUDA support; using CPU for {video_name}"
+            )
         
-        cmd.extend(['-i', video_path])
+        cmd.extend(["-i", video_path])
         
-        # Add video filter for frame range selection and resizing
-        filters = []
+        # Build filter_complex (scale? + split + select)
+        filter_complex = self._build_filter_complex(
+            scenes,
+            self.output_resolution,
+            use_gpu_scale=gpu_enabled,
+        )
+        cmd.extend(["-filter_complex", filter_complex])
         
-        # Select frame range: select='between(n,start,end)'
-        filters.append(f"select='between(n,{start_frame},{end_frame-1})'")
+        # Map each scene output label [o{i}] to its scene dir
+        # Each output needs format specification for image sequences
+        qscale = max(1, 31 - self.jpeg_quality // 3)  # rough mapping 1–100 → 1–31
+        for i, scene_dir in enumerate(scene_dirs):
+            pattern = scene_dir / "frame_%04d.jpg"
+            cmd.extend([
+                "-map", f"[o{i}]",
+                "-vsync", "vfr",  # Variable frame rate - only output selected frames
+                "-q:v", str(qscale),  # JPEG quality
+                "-f", "image2",  # Image sequence format
+                str(pattern)
+            ])
         
-        # Add scaling if needed
-        if resolution:
-            w, h = resolution
-            # Use GPU-accelerated scaling if available
-            if gpu_enabled:
-                filters.append(f"scale_cuda={w}:{h}")
-            else:
-                filters.append(f"scale={w}:{h}")
-        
-        filter_str = ','.join(filters)
-        
-        cmd.extend([
-            '-hide_banner',  # Suppress version/banner output
-            '-loglevel', 'error',  # Only show errors, not warnings/info
-            '-vf', filter_str,
-            '-vsync', 'vfr',  # Variable frame rate - only output selected frames
-            '-q:v', str(max(1, 31 - quality // 3)),  # Convert quality to qscale (1-31, lower=better)
-            '-start_number', '0',  # Start numbering from 0
-            str(output_dir / 'frame_%04d.jpg')
-        ])
-        
-        # Start profiling
         start_wall = time.time()
         start_cpu = time.process_time()
-        scene_size = end_frame - start_frame
         
         try:
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=300  # 5 minute timeout per scene
+                timeout=3600,
             )
-            
-            if result.returncode != 0:
-                stderr = result.stderr.decode('utf-8', errors='ignore')
-                stderr_lower = stderr.lower()
-                
-                # Extract actual error message (skip version/banner output)
-                error_lines = []
-                for line in stderr.split('\n'):
-                    line_stripped = line.strip()
-                    if not line_stripped:
-                        continue
-                    line_lower = line_stripped.lower()
-                    # Skip version/banner lines
-                    if any(x in line_lower for x in ['ffmpeg version', 'copyright', 'configuration:', 'built with', 'libdir=', 'incdir=']):
-                        continue
-                    # Collect actual error lines
-                    error_lines.append(line_stripped)
-                
-                # Get actual error (first few meaningful lines, or fallback to truncated stderr)
-                if error_lines:
-                    actual_error = '\n'.join(error_lines[:3])
-                else:
-                    # If all lines were banner, just show a short snippet
-                    actual_error = stderr.strip()[:200] if stderr.strip() else "Unknown error"
-                
-                # Check if it's a GPU-related error and retry with CPU
-                gpu_error_keywords = [
-                    'cuda', 'hwaccel', 'nvenc', 'nvdec',
-                    'hardware acceleration', 'hwaccel_device',
-                    'not found', 'not available', 'not supported',
-                    'no device', 'device not found', 'cannot find',
-                    'invalid argument', 'unknown option'
-                ]
-                
-                has_gpu_error = any(keyword in stderr_lower for keyword in gpu_error_keywords)
-                
-                if gpu_enabled and has_gpu_error:
-                    self.gpu_failures += 1
-                    self.cpu_fallbacks += 1
-                    self.logger.warning(
-                        f"GPU acceleration failed for scene [{start_frame}-{end_frame}], falling back to CPU. "
-                        f"Error: {actual_error[:200]}"
-                    )
-                    return self._extract_scene_with_ffmpeg(
-                        video_path, start_frame, end_frame, output_dir,
-                        resolution, quality, use_gpu=False
-                    )
-                
-                # Log error (without version banner)
-                error_preview = actual_error[:500] if actual_error else "Unknown error (check FFmpeg output)"
-                self.logger.warning(
-                    f"FFmpeg extraction failed for scene [{start_frame}-{end_frame}]: {error_preview}"
-                )
-                return 0
-            
-            # Count extracted frames
-            frame_files = list(output_dir.glob('frame_*.jpg'))
-            frame_count = len(frame_files)
-            
-            # Calculate profiling metrics
-            wall_time = time.time() - start_wall
-            cpu_time = time.process_time() - start_cpu
-            iowait_approx = max(0, wall_time - cpu_time)
-            fps = frame_count / wall_time if wall_time > 0 else 0
-            
-            # Store profiling data
-            self.profiling_data.append({
-                'wall_time': wall_time,
-                'cpu_time': cpu_time,
-                'iowait_approx': iowait_approx,
-                'frame_count': frame_count,
-                'scene_size': scene_size,
-                'fps': fps
-            })
-            
-            # Log profiling at DEBUG level (detailed per-scene)
-            self.logger.debug(
-                f"Scene [{start_frame}-{end_frame}]: {frame_count} frames in {wall_time:.2f}s "
-                f"(cpu={cpu_time:.2f}s, iowait≈{iowait_approx:.2f}s, {fps:.1f} fps)"
-            )
-            
-            # Log GPU success if GPU was enabled
-            if gpu_enabled:
-                self.gpu_successes += 1
-                self.logger.debug(f"GPU acceleration successful for scene [{start_frame}-{end_frame}]: {frame_count} frames")
-            
-            return frame_count
-            
         except subprocess.TimeoutExpired:
             wall_time = time.time() - start_wall
-            self.logger.error(f"FFmpeg timeout extracting scene from {video_path} after {wall_time:.2f}s")
-            return 0
+            self.logger.error(
+                f"FFmpeg timeout processing {video_name} after {wall_time:.2f}s"
+            )
+            return self._empty_scene_metadata(scenes, "ffmpeg timeout")
         except Exception as e:
             wall_time = time.time() - start_wall
-            self.logger.error(f"FFmpeg extraction error after {wall_time:.2f}s: {str(e)}")
-            return 0
-    
-    def process_scene(
-        self,
-        video_path: str,
-        scene: Tuple[int, int],
-        scene_idx: int,
-        video_name: str,
-        flat_structure: bool = False,
-        use_gpu: bool = True
-    ) -> Dict:
-        """
-        Extract frames from a scene.
-        
-        Args:
-            video_path: Path to video file
-            scene: (start_frame, end_frame)
-            scene_idx: Scene index
-            video_name: Video name for folder
-            flat_structure: Use flat folder structure
-            use_gpu: Use GPU-accelerated FFmpeg
-        
-        Returns:
-            Scene processing metadata
-        """
-        start_frame, end_frame = scene
-        
-        # Determine output directory
-        if flat_structure:
-            scene_dir = self.output_dir / "scenes" / f"{video_name}_scene_{scene_idx:03d}"
-        else:
-            scene_dir = self.output_dir / video_name / f"scene_{scene_idx:03d}"
-        
-        # Extract frames using FFmpeg (with GPU acceleration)
-        saved_count = self._extract_scene_with_ffmpeg(
-            video_path,
-            start_frame,
-            end_frame,
-            scene_dir,
-            self.output_resolution,
-            self.jpeg_quality,
-            use_gpu=use_gpu
-        )
-        
-        metadata = {
-            'scene_idx': scene_idx,
-            'start_frame': start_frame,
-            'end_frame': end_frame,
-            'total_frames': end_frame - start_frame,
-            'selected_frames': end_frame - start_frame,
-            'saved_frames': saved_count,
-            'output_dir': str(scene_dir),
-            'deduplication_enabled': False
-        }
-        
-        self.logger.debug(
-            f"Processed scene {scene_idx}: {saved_count} frames saved to {scene_dir}"
-        )
-        
-        return metadata
-    
-    def _process_single_scene(
-        self,
-        video_path: str,
-        scene: Tuple[int, int],
-        scene_idx: int,
-        video_name: str,
-        flat_structure: bool,
-        use_gpu: bool
-    ) -> Dict:
-        """
-        Process a single scene (worker function for parallel processing).
-        
-        Args:
-            video_path: Path to video file
-            scene: (start_frame, end_frame) tuple
-            scene_idx: Scene index
-            video_name: Video name for folder
-            flat_structure: Use flat folder structure
-            use_gpu: Use GPU-accelerated FFmpeg
-        
-        Returns:
-            Scene metadata dict
-        """
-        try:
-            return self.process_scene(
-                video_path,
-                scene,
-                scene_idx,
-                video_name,
-                flat_structure,
-                use_gpu=use_gpu
+            self.logger.error(
+                f"FFmpeg error processing {video_name} after {wall_time:.2f}s: {e}"
             )
-        except Exception as e:
-            self.logger.error(f"Error processing scene {scene_idx}: {str(e)}")
-            start_frame, end_frame = scene
-            return {
-                'scene_idx': scene_idx,
-                'start_frame': start_frame,
-                'end_frame': end_frame,
-                'total_frames': end_frame - start_frame,
-                'selected_frames': 0,
-                'saved_frames': 0,
-                'output_dir': '',
-                'deduplication_enabled': False,
-                'error': str(e)
+            return self._empty_scene_metadata(scenes, str(e))
+        
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="ignore")
+            stderr_lower = stderr.lower()
+            
+            # Strip banner-ish lines to get a concise error
+            error_lines = []
+            for line in stderr.split("\n"):
+                s = line.strip()
+                if not s:
+                    continue
+                sl = s.lower()
+                if any(
+                    x in sl
+                    for x in [
+                        "ffmpeg version",
+                        "copyright",
+                        "configuration:",
+                        "built with",
+                        "libdir=",
+                        "incdir=",
+                    ]
+                ):
+                    continue
+                error_lines.append(s)
+            
+            actual_error = (
+                "\n".join(error_lines[:3])
+                if error_lines
+                else (stderr.strip()[:200] if stderr.strip() else "Unknown error")
+            )
+            
+            # If GPU was enabled and FFmpeg failed, retry once on CPU
+            # No need for keyword matching - any failure with GPU enabled should fallback
+            if gpu_enabled:
+                self.gpu_failures += 1
+                self.cpu_fallbacks += 1
+                self.logger.warning(
+                    f"GPU run failed for {video_name}, falling back to CPU. "
+                    f"Error: {actual_error[:200]}"
+                )
+                # retry once without GPU
+                return self._run_ffmpeg_single_pass(
+                    video_path, scenes, scene_dirs, use_gpu=False
+                )
+            
+            # If we get here, either GPU was not enabled or CPU run also failed
+            self.logger.warning(
+                f"FFmpeg single-pass extraction failed for {video_name}: {actual_error}"
+            )
+            return self._empty_scene_metadata(scenes, actual_error)
+        
+        # Success: compute per-scene frame counts
+        scene_metadata: List[Dict] = []
+        total_frames = 0
+        
+        for scene_idx, (start_frame, end_frame) in enumerate(scenes):
+            scene_dir = scene_dirs[scene_idx]
+            frame_files = list(scene_dir.glob("frame_*.jpg"))
+            saved = len(frame_files)
+            total_frames += saved
+            
+            scene_metadata.append(
+                {
+                    "scene_idx": scene_idx,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "total_frames": end_frame - start_frame,
+                    "selected_frames": saved,
+                    "saved_frames": saved,
+                    "output_dir": str(scene_dir),
+                    "deduplication_enabled": False,
+                }
+            )
+            
+            self.logger.debug(
+                f"{video_name} scene {scene_idx}: {saved} frames in {scene_dir}"
+            )
+        
+        wall_time = time.time() - start_wall
+        cpu_time = time.process_time() - start_cpu
+        iowait_approx = max(0.0, wall_time - cpu_time)
+        fps = total_frames / wall_time if wall_time > 0 else 0.0
+        
+        self.profiling_data.append(
+            {
+                "wall_time": wall_time,
+                "cpu_time": cpu_time,
+                "iowait_approx": iowait_approx,
+                "frame_count": total_frames,
+                "scene_size": total_frames,
+                "fps": fps,
             }
+        )
+        
+        if gpu_enabled:
+            self.gpu_successes += 1
+            self.logger.debug(
+                f"GPU acceleration successful for {video_name}: {total_frames} frames"
+            )
+        
+        self.logger.info(
+            f"Processed {video_name} (single-pass): {total_frames} frames in "
+            f"{wall_time:.2f}s ({fps:.1f} fps)"
+        )
+        
+        return scene_metadata
+    
+    def _empty_scene_metadata(
+        self,
+        scenes: List[Tuple[int, int]],
+        error: str,
+    ) -> List[Dict]:
+        """Return metadata list with error information for each scene."""
+        meta: List[Dict] = []
+        for i, (start, end) in enumerate(scenes):
+            meta.append(
+                {
+                    "scene_idx": i,
+                    "start_frame": start,
+                    "end_frame": end,
+                    "total_frames": end - start,
+                    "selected_frames": 0,
+                    "saved_frames": 0,
+                    "output_dir": "",
+                    "deduplication_enabled": False,
+                    "error": error,
+                }
+            )
+        return meta
+    
+    # ----------------- public API -----------------
     
     def process_video(
         self,
         video_path: str,
         scenes: List[Tuple[int, int]],
         flat_structure: bool = False,
-        use_gpu: bool = True
+        use_gpu: bool = True,
     ) -> List[Dict]:
         """
-        Process all scenes in a video with optional parallel processing.
-
+        Process all scenes in a video in a single FFmpeg pass.
+        
         Args:
             video_path: Path to video file
             scenes: List of (start_frame, end_frame) tuples
             flat_structure: Use flat folder structure
-            use_gpu: Use GPU acceleration if available (auto-falls back to CPU on error)
-
+            use_gpu: Use GPU acceleration if available (auto-falls back to CPU)
+        
         Returns:
             List of scene metadata dicts
         """
         video_name = Path(video_path).stem
         
-        # Reset GPU statistics and profiling for this video
+        # reset stats
         self.gpu_attempts = 0
         self.gpu_successes = 0
         self.gpu_failures = 0
         self.cpu_fallbacks = 0
         self.profiling_data = []
         
+        # Filter out invalid scenes (end <= start)
+        valid_scenes = []
+        valid_scene_indices = []
+        for i, (start, end) in enumerate(scenes):
+            if end <= start:
+                self.logger.warning(
+                    f"Scene {i} has non-positive length ({start}, {end}), skipping"
+                )
+                continue
+            valid_scenes.append((start, end))
+            valid_scene_indices.append(i)
+        
+        if len(valid_scenes) == 0:
+            self.logger.warning(f"No valid scenes for {video_name}")
+            return self._empty_scene_metadata(scenes, "no valid scenes")
+        
         self.logger.info(
-            f"Processing {len(scenes)} scenes from {video_name} "
-            f"(FFmpeg, workers={self.num_workers}, GPU={'enabled' if use_gpu else 'disabled'})"
+            f"Processing {len(valid_scenes)} scenes from {video_name} "
+            f"(FFmpeg single-pass, GPU={'enabled' if use_gpu else 'disabled'})"
         )
         
-        scene_metadata = []
+        # Build scene dirs only for valid scenes
+        scene_dirs = self._build_scene_dirs(video_name, valid_scenes, flat_structure)
+        scene_metadata = self._run_ffmpeg_single_pass(
+            video_path, valid_scenes, scene_dirs, use_gpu
+        )
         
-        # Use parallel processing if we have multiple scenes and workers
-        if len(scenes) > 1 and self.num_workers > 1:
-            # Prepare arguments for each scene
-            scene_args = [
-                (video_path, scene, scene_idx, video_name, flat_structure, use_gpu)
-                for scene_idx, scene in enumerate(scenes)
-            ]
-            
-            # Process scenes in parallel
-            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                # Submit all tasks
-                future_to_scene = {
-                    executor.submit(self._process_single_scene, *args): idx
-                    for idx, args in enumerate(scene_args)
-                }
-                
-                # Collect results with progress bar
-                scene_results = [None] * len(scenes)
-                
-                for future in tqdm(
-                    as_completed(future_to_scene),
-                    total=len(scenes),
-                    desc=f"Processing {video_name}",
-                    unit="scene"
-                ):
-                    scene_idx = future_to_scene[future]
-                    try:
-                        scene_results[scene_idx] = future.result()
-                    except Exception as e:
-                        self.logger.error(f"Error processing scene {scene_idx}: {str(e)}")
-                        start_frame, end_frame = scenes[scene_idx]
-                        scene_results[scene_idx] = {
-                            'scene_idx': scene_idx,
-                            'start_frame': start_frame,
-                            'end_frame': end_frame,
-                            'total_frames': end_frame - start_frame,
-                            'selected_frames': 0,
-                            'saved_frames': 0,
-                            'output_dir': '',
-                            'deduplication_enabled': False,
-                            'error': str(e)
-                        }
-                
-                scene_metadata = scene_results
-        else:
-            # Sequential processing (single scene or single worker)
-            for scene_idx, scene in enumerate(tqdm(
-                scenes, 
-                desc=f"Processing {video_name}", 
-                unit="scene"
-            )):
-                metadata = self.process_scene(
-                    video_path,
-                    scene,
-                    scene_idx,
-                    video_name,
-                    flat_structure,
-                    use_gpu=use_gpu
-                )
-                scene_metadata.append(metadata)
+        # Map back to original scene indices for metadata
+        # Create a full metadata list with empty entries for invalid scenes
+        full_metadata = []
+        valid_idx = 0
+        for i, (start, end) in enumerate(scenes):
+            if i in valid_scene_indices:
+                # Update scene_idx to match original index
+                meta = scene_metadata[valid_idx].copy()
+                meta['scene_idx'] = i
+                full_metadata.append(meta)
+                valid_idx += 1
+            else:
+                # Invalid scene - add empty metadata
+                full_metadata.append({
+                    'scene_idx': i,
+                    'start_frame': start,
+                    'end_frame': end,
+                    'total_frames': end - start,
+                    'selected_frames': 0,
+                    'saved_frames': 0,
+                    'output_dir': '',
+                    'deduplication_enabled': False,
+                    'error': 'invalid scene (end <= start)',
+                })
         
-        total_frames = sum(m.get('saved_frames', 0) for m in scene_metadata)
-        self.logger.info(f"Processed {video_name}: {total_frames} frames extracted")
+        scene_metadata = full_metadata
         
-        # Log GPU usage statistics
+        # GPU stats logging
         if self.gpu_attempts > 0:
-            gpu_success_rate = (self.gpu_successes / self.gpu_attempts * 100) if self.gpu_attempts > 0 else 0
+            gpu_success_rate = (
+                self.gpu_successes / self.gpu_attempts * 100.0
+                if self.gpu_attempts > 0
+                else 0.0
+            )
             if self.gpu_failures > 0:
                 self.logger.warning(
-                    f"GPU usage for {video_name}: {self.gpu_successes}/{self.gpu_attempts} successful "
-                    f"({gpu_success_rate:.1f}%), {self.gpu_failures} failures, {self.cpu_fallbacks} CPU fallbacks"
+                    f"GPU usage for {video_name}: {self.gpu_successes}/{self.gpu_attempts} "
+                    f"successful ({gpu_success_rate:.1f}%), "
+                    f"{self.gpu_failures} failures, {self.cpu_fallbacks} CPU fallbacks"
                 )
             else:
                 self.logger.info(
-                    f"GPU usage for {video_name}: {self.gpu_successes}/{self.gpu_attempts} successful "
-                    f"({gpu_success_rate:.1f}%)"
+                    f"GPU usage for {video_name}: {self.gpu_successes}/{self.gpu_attempts} "
+                    f"successful ({gpu_success_rate:.1f}%)"
                 )
         
-        # Log profiling summary
+        # Profiling summary
         if self.profiling_data:
-            total_wall = sum(p['wall_time'] for p in self.profiling_data)
-            total_cpu = sum(p['cpu_time'] for p in self.profiling_data)
-            total_iowait = sum(p['iowait_approx'] for p in self.profiling_data)
-            avg_fps = sum(p['fps'] for p in self.profiling_data) / len(self.profiling_data) if self.profiling_data else 0
-            
-            # Calculate percentiles for wall time
-            wall_times = sorted([p['wall_time'] for p in self.profiling_data])
-            p50 = wall_times[len(wall_times) // 2] if wall_times else 0
-            p95 = wall_times[int(len(wall_times) * 0.95)] if wall_times else 0
-            
+            p = self.profiling_data[0]  # single entry
             self.logger.info(
-                f"FFmpeg profiling for {video_name}: "
-                f"total={total_wall:.1f}s (cpu={total_cpu:.1f}s, iowait≈{total_iowait:.1f}s), "
-                f"avg={p50:.2f}s/scene (p95={p95:.2f}s), "
-                f"avg_speed={avg_fps:.1f} fps"
+                f"FFmpeg profiling for {video_name}: total={p['wall_time']:.1f}s "
+                f"(cpu={p['cpu_time']:.1f}s, iowait≈{p['iowait_approx']:.1f}s), "
+                f"avg_speed={p['fps']:.1f} fps"
             )
         
         return scene_metadata
-

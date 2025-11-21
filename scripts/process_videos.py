@@ -75,8 +75,6 @@ def parse_arguments():
                        help='Enable entropy-based frame deduplication')
     parser.add_argument('--entropy-percentile', type=float,
                        help='Keep frames above this entropy percentile (0.0-100.0)')
-    parser.add_argument('--frame-workers', type=int,
-                       help='Number of parallel workers for frame extraction')
     
     # Folder structure
     parser.add_argument('--flat-structure', action='store_true',
@@ -151,8 +149,6 @@ def apply_cli_overrides(args, config):
         config['enable_deduplication'] = True
     if args.entropy_percentile is not None:
         config['entropy_percentile'] = args.entropy_percentile
-    if args.frame_workers is not None:
-        config['frame_workers'] = args.frame_workers
     
     # Folder structure
     if args.flat_structure:

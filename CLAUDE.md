@@ -16,8 +16,8 @@ python scripts/process_videos.py
 # With custom URLs file and output directory
 python scripts/process_videos.py -u /path/to/urls.txt --output-dir /path/to/output
 
-# Override workers and enable deduplication
-python scripts/process_videos.py --num-workers 8 --enable-deduplication --frame-workers 4
+# Override download workers and enable deduplication
+python scripts/process_videos.py --num-workers 8 --enable-deduplication
 
 # Skip validation and disable scene detection
 python scripts/process_videos.py --skip-validation --no-scene-detection
@@ -73,11 +73,12 @@ Each video is processed individually through stages 2-4. The pipeline uses files
 - This prevents data loss when scene detection fails
 
 **FrameProcessorFFmpeg** (src/frame_processor_ffmpeg.py)
-- **5-10x faster than OpenCV** due to batch FFmpeg extraction
-- Parallel scene processing via ThreadPoolExecutor
-- FFmpeg select filter for frame range extraction: `-vf "select='between(n,start,end)'"`
-- GPU acceleration support via NVDEC (hwaccel parameter)
-- Returns scene metadata: `[{'scene_id': int, 'start_frame': int, 'end_frame': int, 'saved_frames': int, 'output_path': str}]`
+- **5-10x faster than OpenCV** due to single-pass FFmpeg extraction
+- **Single FFmpeg call per video** using `filter_complex` with `split` + `select` filters
+- All scenes extracted in one pass: `[0:v]scale?,split=N -> per-scene select -> direct output`
+- No I/O contention, no re-decoding, no temp folders, no hardlinks
+- GPU acceleration support via NVDEC (hwaccel parameter) and CUDA scaling (scale_cuda)
+- Returns scene metadata: `[{'scene_idx': int, 'start_frame': int, 'end_frame': int, 'saved_frames': int, 'output_dir': str}]`
 
 **ManifestManager** (src/manifest_manager.py)
 - Tracks processing metadata in JSON format (reporting/logging only)
@@ -121,21 +122,21 @@ All settings in `config.yaml` can be overridden via CLI arguments. The CLI parsi
 
 **Key config values:**
 - `num_workers`: Parallel download workers (multiprocessing)
-- `frame_workers`: Parallel scene extraction workers (threading)
 - `flat_structure`: Changes output structure (hierarchical vs flat)
 - `detect_scenes`: Can be disabled to treat videos as single scene
-- `downscale_factor`: Scene detection downscaling (4 = good balance, 8 = faster but may miss scenes, 2 = slower but more accurate)
+- `downscale_factor`: Scene detection downscaling (2 = good balance, 4 = faster but may miss scenes, 1 = slower but most accurate)
 - `output_resolution`: Tuple [width, height] or null for original
+- `use_gpu`: Enable GPU acceleration (auto-falls back to CPU on error)
 
 ### Critical Implementation Details
 
 **GPU Acceleration Status:**
-GPU support is ENABLED by default and stable. The code automatically falls back to CPU if GPU is unavailable (src/frame_processor_ffmpeg.py:100-148). To disable GPU explicitly, use `--use-cpu` flag or set `use_gpu: false` in config.yaml.
+GPU support is ENABLED by default and stable. The code automatically falls back to CPU if GPU fails for ANY reason (src/frame_processor_ffmpeg.py:273-292). This includes format errors, device issues, or any FFmpeg failure when GPU is enabled. To disable GPU explicitly, use `--use-cpu` flag or set `use_gpu: false` in config.yaml.
 
 **Verifying GPU is Working:**
 Check logs during frame extraction stage:
-- GPU working: Logs will show FFmpeg commands with `-hwaccel cuda`
-- CPU fallback: Logs will show "GPU acceleration failed, retrying with CPU"
+- GPU working: Logs will show FFmpeg commands with `-hwaccel cuda` and successful processing
+- CPU fallback: Logs will show "GPU run failed for <video>, falling back to CPU" followed by successful CPU processing
 - To force CPU-only: Use `--use-cpu` flag
 
 **Multiprocessing Worker Functions:**
@@ -155,10 +156,11 @@ Processing skip decisions are based on filesystem checks (src/pipeline.py:116-13
 - Flat: Checks `{output_dir}/scenes/{video_name}_scene_*/frame_0000.jpg`
 
 **FFmpeg Command Pattern:**
-Frame extraction uses select filter for precise frame ranges:
+Frame extraction uses filter_complex to extract all scenes in one pass:
 ```bash
-ffmpeg -i input.mp4 -vf "select='between(n,start,end)',scale=W:H" -qscale:v Q output_%04d.jpg
+ffmpeg -i input.mp4 -filter_complex "[0:v]scale=W:H,split=N[v0][v1]...[vN-1];[v0]select='between(n,start0,end0)'[o0];[v1]select='between(n,start1,end1)'[o1];..." -map [o0] scene0/frame_%04d.jpg -map [o1] scene1/frame_%04d.jpg ...
 ```
+This extracts all scenes simultaneously in a single decode pass, eliminating I/O contention.
 
 **Error Suppression:**
 OpenCV h264 warnings are suppressed via FilteredStderr context manager to reduce log noise.
@@ -177,13 +179,14 @@ Metadata: `data/manifest.json`
 ## Performance Considerations
 
 - FFmpeg frame extraction is 5-10x faster than OpenCV per-frame reading
-- **GPU acceleration (NVDEC)**: 3-5x additional speedup for frame extraction via FFmpeg hardware decoding
+- **Single-pass extraction**: All scenes extracted in one FFmpeg call using filter_complex (no I/O contention, no re-decoding)
+- **GPU acceleration (NVDEC/CUDA)**: 3-5x additional speedup for frame extraction via FFmpeg hardware decoding and scaling
   - Automatically enabled by default (`use_gpu: true` in config.yaml)
-  - Graceful fallback: If GPU unavailable or FFmpeg lacks CUDA support, auto-retries with CPU (src/frame_processor_ffmpeg.py:143-148)
-  - Verify GPU usage: Check FFmpeg logs for "hwaccel cuda" messages
+  - Robust fallback: If GPU run fails for ANY reason (format errors, device issues, etc.), automatically retries with CPU
+  - No frames lost: CPU fallback ensures frames are always extracted even if GPU fails
+  - Verify GPU usage: Check FFmpeg logs for "hwaccel cuda" and "scale_cuda" messages, or "GPU run failed" for fallback
 - Parallel downloads limited by network bandwidth, not CPU
 - Scene detection is CPU-bound; downscale_factor trades accuracy for speed
-- Frame extraction parallelism is I/O-bound; too many workers causes disk contention
 - Default JPEG quality reduced from 95→75 for imperceptible quality loss but faster encoding
 
 ### Processing Time Estimates (1-hour video, ~75 scenes)

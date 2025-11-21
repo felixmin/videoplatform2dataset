@@ -64,7 +64,6 @@ def run_pipeline(config: Dict, skip_validation: bool = False, use_cpu: bool = Fa
         output_dir=config['output_dir'],
         output_resolution=tuple(config['output_resolution']) if config.get('output_resolution') else None,
         jpeg_quality=config.get('jpeg_quality', 85),
-        num_workers=config.get('frame_workers'),
         logger=logger
     )
     

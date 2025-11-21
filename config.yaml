@@ -168,38 +168,6 @@ enable_deduplication: true
 # Examples: 50.0 = keep top 50% most informative frames
 entropy_percentile: 50.0
 
-# frame_workers: Number of parallel workers for frame extraction (null = auto-detect)
-# Used by: FrameProcessorFFmpeg via ThreadPoolExecutor (src/frame_processor_ffmpeg.py:46)
-# 
-# PERFORMANCE TRADE-OFF:
-#   More workers = faster wall-clock time (parallelism) but slower per-scene (I/O contention)
-#   Fewer workers = slower wall-clock time (sequential) but faster per-scene (no contention)
-# 
-# Example with 8 scenes:
-#   - 8 workers: ~43s wall-clock (8 scenes in parallel), but each scene takes ~43s due to contention
-#   - 1 worker:  ~68s wall-clock (8 scenes sequential), but each scene takes ~8.5s (no contention)
-#   Result: 8 workers is ~37% faster in wall-clock time, but 5x less efficient per scene
-# 
-# WHEN TO USE MORE WORKERS (2-8):
-#   - Fast storage (NVMe SSD with high IOPS)
-#   - Large scenes (more work per scene, overhead matters less)
-#   - Processing multiple videos simultaneously (different files, less contention)
-#   - You prioritize total wall-clock time over per-scene efficiency
-# 
-# WHEN TO USE 1 WORKER (current default):
-#   - Slower storage (HDD, network storage, slow SSD)
-#   - Many small scenes (high overhead, contention hurts more)
-#   - Single video processing (same file, high contention)
-#   - You prioritize per-scene efficiency and want consistent performance
-# 
-# Examples:
-#   1    - Sequential (default, best for slow storage or single video)
-#   2-4  - Balanced (good for moderate storage, multiple videos)
-#   8    - Aggressive (fast NVMe SSD, many videos in parallel)
-#   null - Auto (min(8, cpu_count), not recommended - use explicit value)
-# 
-# Note: Threading-based (not multiprocessing), limited by I/O not CPU
-frame_workers: 2
 
 
 # ============================================================
@@ -207,7 +175,7 @@ frame_workers: 2
 # ============================================================
 
 # flat_structure: Organize output scenes in flat vs hierarchical structure
-# Used by: FrameProcessorFFmpeg.process_scene() (src/frame_processor_ffmpeg.py:198)
+# Used by: FrameProcessorFFmpeg._build_scene_dirs() (src/frame_processor_ffmpeg.py)
 # false - Hierarchical: {output_dir}/{video_name}/scene_{N}/frame_{M}.jpg
 # true  - Flat:         {output_dir}/scenes/{video_name}_scene_{N}/frame_{M}.jpg
 # Flat is better for: Large datasets where filesystem has directory limits
@@ -219,14 +187,16 @@ flat_structure: false
 # PERFORMANCE
 # ============================================================
 
-# use_gpu: Enable GPU-accelerated decoding via FFmpeg NVDEC
-# Used by: FrameProcessorFFmpeg._extract_scene_with_ffmpeg() (src/frame_processor_ffmpeg.py:100)
+# use_gpu: Enable GPU-accelerated decoding and scaling via FFmpeg NVDEC/CUDA
+# Used by: FrameProcessorFFmpeg._run_ffmpeg_single_pass() (src/frame_processor_ffmpeg.py)
 # Requires: NVIDIA GPU with NVDEC support + FFmpeg with CUDA support
 # Speedup: 3-5x faster frame extraction vs CPU-only
 # Behavior:
-#   true  - Try GPU first, auto-fall back to CPU on error (recommended)
-#   false - CPU-only (more compatible, slower)
-# Note: GPU failures are logged but do not stop processing
+#   true  - Try GPU first, automatically fall back to CPU on ANY error (recommended)
+#           If GPU run fails for any reason (format errors, device issues, etc.), 
+#           automatically retries with CPU-only mode. No frames are lost.
+#   false - CPU-only (more compatible, slower, but always works)
+# Note: GPU failures are logged but do not stop processing - automatic CPU fallback ensures frames are extracted
 # Override with: --use-cpu flag to force CPU-only
 use_gpu: true
 
@@ -243,7 +213,7 @@ use_gpu: true
 # WARNING - Quiet (only shows issues)
 # ERROR   - Silent (only shows failures)
 # Override with: -v or --verbose flag (sets to DEBUG)
-log_level: "INFO"
+log_level: "DEBUG"
 
 # log_file: Path to log file (null = no file logging, only console)
 # Used by: utils.setup_logging() (src/utils.py)

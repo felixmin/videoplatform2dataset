@@ -8,9 +8,9 @@ A production-ready video processing pipeline designed for moderate-scale deep le
 - **Smart Skipping**: Automatically skips already downloaded videos and already processed videos (filesystem-based checks)
 - **Integrity Validation**: FFmpeg-based validation (optional, with OpenCV fallback) and black frame detection
 - **Scene Detection**: Automatic scene boundary detection using PySceneDetect
-- **Fast Frame Extraction**: FFmpeg-based batch frame extraction with GPU acceleration support (5-10x faster than OpenCV)
-- **Parallel Frame Extraction**: Multi-threaded frame extraction from multiple scenes
-- **GPU Acceleration**: Optional NVIDIA GPU acceleration via FFmpeg NVDEC for H.264 decoding and scaling
+- **Fast Frame Extraction**: FFmpeg-based single-pass frame extraction with GPU acceleration support (5-10x faster than OpenCV)
+- **Single-Pass Processing**: All scenes extracted in one FFmpeg call using filter_complex (no I/O contention, no re-decoding)
+- **GPU Acceleration**: Optional NVIDIA GPU acceleration via FFmpeg NVDEC for H.264 decoding and CUDA scaling
 - **Metadata Tracking**: Comprehensive manifest system for processing history (reporting/logging only)
 
 ## Installation
@@ -97,7 +97,6 @@ scene_threshold: 3.0
 # Frame Extraction
 output_resolution: [256, 256]
 jpeg_quality: 75
-frame_workers: 1  # Number of parallel workers (see Performance section for trade-offs)
 
 # Folder Structure
 flat_structure: false  # true = all scenes in one folder, false = hierarchical
@@ -139,7 +138,6 @@ Scene Detection:
 Frame Extraction:
   --resolution WIDTHxHEIGHT    Output resolution (e.g., 256x256)
   --jpeg-quality N            JPEG quality 1-100 (default: 75)
-  --frame-workers N           Number of parallel workers for frame extraction
 
 Folder Structure:
   --flat-structure            Use flat structure (all scenes in one folder)
@@ -153,7 +151,7 @@ Logging:
   -v, --verbose               Verbose logging (sets log level to DEBUG)
 
 Examples:
-  # Override output directory and workers
+  # Override output directory and download workers
   python scripts/process_videos.py --output-dir /path/to/output --num-workers 8
   
   # Use different URLs file and skip validation
@@ -237,31 +235,7 @@ For **20 videos × 1.5 hours** (30 hours total):
 | Frame Extraction | 1-3 hours (FFmpeg CPU) | 15-45 minutes (FFmpeg GPU) |
 | **Total** | **3-9 hours** | **2-7 hours** |
 
-**Note**: Frame extraction uses FFmpeg batch processing (5-10x faster than OpenCV). GPU acceleration provides additional 3-5x speedup when available.
-
-### Frame Workers Trade-off (`frame_workers`)
-
-The `frame_workers` setting controls parallel processing of scenes. There's an important trade-off:
-
-**Performance Comparison (8 scenes example):**
-- **8 workers (parallel)**: ~43s wall-clock time, but each scene takes ~43s due to I/O contention
-- **1 worker (sequential)**: ~68s wall-clock time, but each scene takes ~8.5s (no contention)
-
-**Result**: More workers = faster total time but slower per-scene efficiency.
-
-**When to use more workers (2-8):**
-- ✅ Fast storage (NVMe SSD with high IOPS)
-- ✅ Large scenes (more work per scene, overhead matters less)
-- ✅ Processing multiple videos simultaneously (different files, less contention)
-- ✅ Priority: total wall-clock time
-
-**When to use 1 worker (default):**
-- ✅ Slower storage (HDD, network storage, slow SSD)
-- ✅ Many small scenes (high overhead, contention hurts more)
-- ✅ Single video processing (same file, high contention)
-- ✅ Priority: per-scene efficiency and consistent performance
-
-**Recommendation**: Start with `frame_workers: 1` (default). If you have fast NVMe storage and process multiple videos, try `frame_workers: 2-4` and monitor performance.
+**Note**: Frame extraction uses FFmpeg single-pass processing with `filter_complex` to extract all scenes in one call (5-10x faster than OpenCV). This eliminates I/O contention and re-decoding overhead. GPU acceleration provides additional 3-5x speedup when available. If GPU fails for any reason, the system automatically falls back to CPU to ensure frames are always extracted.
 
 ## Hardware Recommendations
 
@@ -285,13 +259,13 @@ conda install -c conda-forge opencv
 
 ### FFmpeg not found
 
-FFmpeg is **required** for frame extraction. The pipeline uses FFmpeg for fast batch frame extraction. If FFmpeg is not installed, frame extraction will fail. Install FFmpeg using your system package manager (see Installation section).
+FFmpeg is **required** for frame extraction. The pipeline uses FFmpeg for single-pass frame extraction (all scenes in one call). If FFmpeg is not installed, frame extraction will fail. Install FFmpeg using your system package manager (see Installation section).
 
 For validation, FFmpeg is optional - the pipeline will use OpenCV-based integrity checking as a fallback.
 
 ### Out of memory
 
-- Reduce `num_workers` or `frame_workers` in config
+- Reduce `num_workers` in config (download workers)
 - Lower `output_resolution`
 - Reduce `jpeg_quality` to decrease memory usage during encoding
 
