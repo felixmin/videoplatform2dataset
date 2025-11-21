@@ -54,7 +54,7 @@ max_downloads: null
 #   4 - Balanced (recommended for most cases)
 #   8 - Aggressive (fast connection, dedicated machine)
 # Note: Limited by network bandwidth, not CPU
-num_workers: 4
+num_workers: 1
 
 
 # ============================================================
@@ -108,7 +108,7 @@ scene_detector: "adaptive"
 #   3.0     - Balanced (default, works for most videos)
 #   5.0-10.0 - Conservative (only major scene changes)
 # Note: Meaning varies by detector type
-scene_threshold: 3.0
+scene_threshold: 1.5
 
 # min_scene_length: Minimum number of frames per scene
 # Used by: SceneDetector._create_detector() (src/scene_detector.py:48-60)
@@ -170,14 +170,36 @@ entropy_percentile: 50.0
 
 # frame_workers: Number of parallel workers for frame extraction (null = auto-detect)
 # Used by: FrameProcessorFFmpeg via ThreadPoolExecutor (src/frame_processor_ffmpeg.py:46)
-# Trade-off: More workers = faster but more I/O contention
+# 
+# PERFORMANCE TRADE-OFF:
+#   More workers = faster wall-clock time (parallelism) but slower per-scene (I/O contention)
+#   Fewer workers = slower wall-clock time (sequential) but faster per-scene (no contention)
+# 
+# Example with 8 scenes:
+#   - 8 workers: ~43s wall-clock (8 scenes in parallel), but each scene takes ~43s due to contention
+#   - 1 worker:  ~68s wall-clock (8 scenes sequential), but each scene takes ~8.5s (no contention)
+#   Result: 8 workers is ~37% faster in wall-clock time, but 5x less efficient per scene
+# 
+# WHEN TO USE MORE WORKERS (2-8):
+#   - Fast storage (NVMe SSD with high IOPS)
+#   - Large scenes (more work per scene, overhead matters less)
+#   - Processing multiple videos simultaneously (different files, less contention)
+#   - You prioritize total wall-clock time over per-scene efficiency
+# 
+# WHEN TO USE 1 WORKER (current default):
+#   - Slower storage (HDD, network storage, slow SSD)
+#   - Many small scenes (high overhead, contention hurts more)
+#   - Single video processing (same file, high contention)
+#   - You prioritize per-scene efficiency and want consistent performance
+# 
 # Examples:
-#   null - Auto (min(4, cpu_count), recommended)
-#   2    - Conservative (slow storage or many concurrent jobs)
-#   4    - Balanced (good for most systems)
-#   8    - Aggressive (fast SSD, high-end CPU)
+#   1    - Sequential (default, best for slow storage or single video)
+#   2-4  - Balanced (good for moderate storage, multiple videos)
+#   8    - Aggressive (fast NVMe SSD, many videos in parallel)
+#   null - Auto (min(8, cpu_count), not recommended - use explicit value)
+# 
 # Note: Threading-based (not multiprocessing), limited by I/O not CPU
-frame_workers: null
+frame_workers: 2
 
 
 # ============================================================

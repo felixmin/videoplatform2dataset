@@ -97,7 +97,7 @@ scene_threshold: 3.0
 # Frame Extraction
 output_resolution: [256, 256]
 jpeg_quality: 75
-frame_workers: null  # Number of parallel workers (null = auto-detect, typically 4)
+frame_workers: 1  # Number of parallel workers (see Performance section for trade-offs)
 
 # Folder Structure
 flat_structure: false  # true = all scenes in one folder, false = hierarchical
@@ -238,6 +238,30 @@ For **20 videos × 1.5 hours** (30 hours total):
 | **Total** | **3-9 hours** | **2-7 hours** |
 
 **Note**: Frame extraction uses FFmpeg batch processing (5-10x faster than OpenCV). GPU acceleration provides additional 3-5x speedup when available.
+
+### Frame Workers Trade-off (`frame_workers`)
+
+The `frame_workers` setting controls parallel processing of scenes. There's an important trade-off:
+
+**Performance Comparison (8 scenes example):**
+- **8 workers (parallel)**: ~43s wall-clock time, but each scene takes ~43s due to I/O contention
+- **1 worker (sequential)**: ~68s wall-clock time, but each scene takes ~8.5s (no contention)
+
+**Result**: More workers = faster total time but slower per-scene efficiency.
+
+**When to use more workers (2-8):**
+- ✅ Fast storage (NVMe SSD with high IOPS)
+- ✅ Large scenes (more work per scene, overhead matters less)
+- ✅ Processing multiple videos simultaneously (different files, less contention)
+- ✅ Priority: total wall-clock time
+
+**When to use 1 worker (default):**
+- ✅ Slower storage (HDD, network storage, slow SSD)
+- ✅ Many small scenes (high overhead, contention hurts more)
+- ✅ Single video processing (same file, high contention)
+- ✅ Priority: per-scene efficiency and consistent performance
+
+**Recommendation**: Start with `frame_workers: 1` (default). If you have fast NVMe storage and process multiple videos, try `frame_workers: 2-4` and monitor performance.
 
 ## Hardware Recommendations
 
