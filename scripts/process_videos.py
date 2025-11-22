@@ -75,11 +75,25 @@ def parse_arguments():
                        help='Enable entropy-based frame deduplication')
     parser.add_argument('--entropy-percentile', type=float,
                        help='Keep frames above this entropy percentile (0.0-100.0)')
-    
+
+    # Motion analysis and stabilization
+    parser.add_argument('--analyze-motion', action='store_true',
+                       help='Enable camera motion analysis (generates scenes.csv)')
+    parser.add_argument('--stabilize-video', action='store_true',
+                       help='Stabilize video before frame extraction (requires --analyze-motion)')
+    parser.add_argument('--max-trans-low', type=float,
+                       help='Max translation threshold for static label (pixels)')
+    parser.add_argument('--max-trans-high', type=float,
+                       help='Max translation threshold for moving label (pixels)')
+    parser.add_argument('--max-angle-low', type=float,
+                       help='Max rotation threshold for static label (radians)')
+    parser.add_argument('--max-angle-high', type=float,
+                       help='Max rotation threshold for moving label (radians)')
+
     # Folder structure
     parser.add_argument('--flat-structure', action='store_true',
                        help='Use flat structure (all scenes in one folder)')
-    
+
     # Performance
     parser.add_argument('--use-cpu', action='store_true',
                        help='Disable GPU acceleration (use CPU only)')
@@ -150,14 +164,31 @@ def apply_cli_overrides(args, config):
     if args.entropy_percentile is not None:
         config['entropy_percentile'] = args.entropy_percentile
     
+    # Motion analysis and stabilization
+    if args.analyze_motion:
+        config['analyze_motion'] = True
+    if args.stabilize_video:
+        config['stabilize_video'] = True
+    # Update motion thresholds if provided
+    if 'motion_thresholds' not in config:
+        config['motion_thresholds'] = {}
+    if args.max_trans_low is not None:
+        config['motion_thresholds']['max_trans_low'] = args.max_trans_low
+    if args.max_trans_high is not None:
+        config['motion_thresholds']['max_trans_high'] = args.max_trans_high
+    if args.max_angle_low is not None:
+        config['motion_thresholds']['max_angle_low'] = args.max_angle_low
+    if args.max_angle_high is not None:
+        config['motion_thresholds']['max_angle_high'] = args.max_angle_high
+
     # Folder structure
     if args.flat_structure:
         config['flat_structure'] = True
-    
+
     # Performance
     if args.use_cpu:
         config['use_gpu'] = False
-    
+
     # Logging
     if args.log_level:
         config['log_level'] = args.log_level

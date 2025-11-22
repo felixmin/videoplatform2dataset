@@ -25,6 +25,9 @@ python scripts/process_videos.py --skip-validation --no-scene-detection
 # Custom resolution and quality
 python scripts/process_videos.py --resolution 512x512 --jpeg-quality 90
 
+# Enable motion analysis and stabilization
+python scripts/process_videos.py --analyze-motion --stabilize-video
+
 # Verbose logging
 python scripts/process_videos.py -v
 ```
@@ -41,15 +44,16 @@ brew install ffmpeg          # macOS
 
 ## Architecture
 
-### Pipeline Flow (src/pipeline.py:20-225)
-The main pipeline orchestrates 4 sequential stages:
+### Pipeline Flow (src/pipeline.py:20-347)
+The main pipeline orchestrates 5 sequential stages:
 
 1. **Download Stage** - Parallel video downloads via `ParallelVideoDownloader`
 2. **Validation Stage** - FFmpeg-based integrity checking via `IntegrityChecker`
 3. **Scene Detection Stage** - PySceneDetect integration via `SceneDetector`
-4. **Frame Extraction Stage** - FFmpeg batch extraction via `FrameProcessorFFmpeg`
+4. **Motion Analysis & Stabilization Stage (Optional)** - Camera motion detection and video stabilization via `MotionAnalyzer`
+5. **Frame Extraction Stage** - FFmpeg batch extraction via `FrameProcessorFFmpeg`
 
-Each video is processed individually through stages 2-4. The pipeline uses filesystem checks to skip already-processed videos (looks for existing frame directories).
+Each video is processed individually through stages 2-5. The pipeline uses filesystem checks to skip already-processed videos (looks for existing frame directories).
 
 ### Component Responsibilities
 
@@ -69,8 +73,20 @@ Each video is processed individually through stages 2-4. The pipeline uses files
 - Wraps PySceneDetect with three detector types: content, adaptive, threshold
 - Returns list of (start_frame, end_frame) tuples
 - Uses downscale_factor for performance optimization
-- **Critical fallback:** If scene detection returns 0 scenes, pipeline automatically treats entire video as one scene (src/pipeline.py:166-171)
+- **Critical fallback:** If scene detection returns 0 scenes, pipeline automatically treats entire video as one scene (src/pipeline.py:169-175)
 - This prevents data loss when scene detection fails
+
+**MotionAnalyzer** (src/motion_analyzer.py)
+- Uses FFmpeg's libvidstab for camera motion detection and video stabilization
+- **Single-pass analysis:** Generates .trf file with per-frame transformation data via vidstabdetect
+- **Per-scene aggregation:** Calculates max_trans (translation) and max_angle (rotation) metrics per scene
+- **Scene classification:** Labels scenes as "static", "moving", or "uncertain" based on configurable thresholds
+- **Optional stabilization:** Creates stabilized video via vidstabtransform using .trf data
+- **Post-stabilization verification:** Re-analyzes stabilized video to measure improvement
+- **Optimization:** Uses 360p downscaling for 4-10x speedup with negligible accuracy impact
+- **TRF Format Support:** Handles both verbose format (local motion vectors) and simple format (global transforms)
+- **Robust aggregation:** Uses median of local motion vectors to ignore moving objects (outliers)
+- Returns scene metadata: `[{'scene_idx': int, 'start_frame': int, 'end_frame': int, 'max_trans': float, 'max_angle': float, 'label': str, 'stabilized_*': float (if stabilization enabled)}]`
 
 **FrameProcessorFFmpeg** (src/frame_processor_ffmpeg.py)
 - **5-10x faster than OpenCV** due to single-pass FFmpeg extraction
@@ -127,6 +143,9 @@ All settings in `config.yaml` can be overridden via CLI arguments. The CLI parsi
 - `downscale_factor`: Scene detection downscaling (2 = good balance, 4 = faster but may miss scenes, 1 = slower but most accurate)
 - `output_resolution`: Tuple [width, height] or null for original
 - `use_gpu`: Enable GPU acceleration (auto-falls back to CPU on error)
+- `analyze_motion`: Enable camera motion detection (default: false)
+- `stabilize_video`: Enable video stabilization before frame extraction (requires analyze_motion, default: false)
+- `motion_thresholds`: Dict with max_trans_low/high and max_angle_low/high for scene classification
 
 ### Critical Implementation Details
 
@@ -151,9 +170,39 @@ progress_dict[idx] = current  # Required for sync
 ```
 
 **Skip Logic:**
-Processing skip decisions are based on filesystem checks (src/pipeline.py:116-138):
+Processing skip decisions are based on filesystem checks (src/pipeline.py:120-142):
 - Hierarchical: Checks `{output_dir}/{video_name}/scene_*/frame_0000.jpg`
 - Flat: Checks `{output_dir}/scenes/{video_name}_scene_*/frame_0000.jpg`
+
+**Motion Analysis Pipeline Integration:**
+Motion analysis is integrated as Stage 3.5 between scene detection and frame extraction (src/pipeline.py:185-308):
+1. Run vidstabdetect on original video → generates .trf file
+2. Parse .trf file using regex to extract local motion vectors (handles verbose format)
+3. Aggregate per-scene metrics using median (robust to outliers)
+4. Classify scenes as static/moving/uncertain based on thresholds
+5. If stabilization enabled:
+   - Run vidstabtransform to create stabilized video
+   - Update `processing_video_path` and `output_video_name` to use stabilized version
+   - Run post-stabilization analysis to measure improvement
+   - Merge post-stabilization metrics into scene metadata
+6. Extract frames from `processing_video_path` (original or stabilized)
+7. Write CSV with scene motion metadata to same folder as frames
+8. Clean up temporary files (.trf, stabilized video)
+
+**TRF File Format Handling:**
+The motion analyzer supports two TRF formats:
+- **Verbose format** (common): `Frame N (List M [(LM dx dy x y size contrast ...)])`
+  - Uses regex: `r"\(LM\s+(-?\d+)\s+(-?\d+)"` to extract local motion vectors
+  - Aggregates using `np.median()` to compute global camera motion
+- **Simple format** (older): `frame_num dx dy da ...`
+  - Direct parsing of space-separated values
+
+**CSV Output Location:**
+CSV is written AFTER frame extraction to ensure it lands in the correct folder (src/pipeline.py:282-303):
+- Uses `output_video_name` which reflects whether stabilized video was used
+- Hierarchical: `{output_dir}/{output_video_name}/scenes.csv`
+- Flat: `{output_dir}/scenes/{output_video_name}_scenes.csv`
+- Dynamic fieldnames based on metadata keys (includes stabilized_* columns if present)
 
 **FFmpeg Command Pattern:**
 Frame extraction uses filter_complex to extract all scenes in one pass:
@@ -171,10 +220,12 @@ Input: `data/urls.txt` (one URL per line)
 ↓
 Download: `data/raw/{video_id}.mp4`
 ↓
-Process: Validation → Scene Detection → Frame Extraction
+Process: Validation → Scene Detection → Motion Analysis & Stabilization (optional) → Frame Extraction
 ↓
-Output: `data/processed/{video_name}/scene_{N}/frame_{M}.jpg`
-Metadata: `data/manifest.json`
+Output:
+- Frames: `data/processed/{video_name}/scene_{N}/frame_{M}.jpg`
+- Motion CSV: `data/processed/{video_name}/scenes.csv` (if --analyze-motion enabled)
+- Metadata: `data/manifest.json`
 
 ## Performance Considerations
 
@@ -188,6 +239,9 @@ Metadata: `data/manifest.json`
 - Parallel downloads limited by network bandwidth, not CPU
 - Scene detection is CPU-bound; downscale_factor trades accuracy for speed
 - Default JPEG quality reduced from 95→75 for imperceptible quality loss but faster encoding
+- **Motion analysis optimization**: Uses 360p downscaling for 4-10x speedup with negligible accuracy impact
+- **Stabilization overhead**: Requires two additional FFmpeg passes (detection + transformation) per video
+- **Median aggregation**: Using median of local motion vectors is robust to moving objects (outliers) in scene
 
 ### Processing Time Estimates (1-hour video, ~75 scenes)
 
@@ -196,8 +250,12 @@ Metadata: `data/manifest.json`
 | Download | 5-10 min | 5-10 min |
 | Validation (skip recommended) | 2-4 min | 2-4 min |
 | Scene Detection | 20-40 sec | 20-40 sec |
+| Motion Analysis (if enabled) | 15-30 sec | 15-30 sec |
+| Stabilization (if enabled) | 1-3 min | 1-3 min |
+| Post-Stabilization Analysis (if enabled) | 15-30 sec | 15-30 sec |
 | Frame Extraction | 3-6 min | 45-90 sec |
-| **Total (skip validation)** | **9-12 min** | **2-3 min** |
+| **Total (skip validation, no motion)** | **9-12 min** | **2-3 min** |
+| **Total (skip validation, motion + stabilization)** | **12-17 min** | **4-8 min** |
 
 ## Testing
 

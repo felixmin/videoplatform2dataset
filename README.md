@@ -11,6 +11,8 @@ A production-ready video processing pipeline designed for moderate-scale deep le
 - **Fast Frame Extraction**: FFmpeg-based single-pass frame extraction with GPU acceleration support (5-10x faster than OpenCV)
 - **Single-Pass Processing**: All scenes extracted in one FFmpeg call using filter_complex (no I/O contention, no re-decoding)
 - **GPU Acceleration**: Optional NVIDIA GPU acceleration via FFmpeg NVDEC for H.264 decoding and CUDA scaling
+- **Camera Motion Analysis**: Automatic camera motion detection per scene using FFmpeg libvidstab with configurable thresholds
+- **Video Stabilization**: Optional video stabilization before frame extraction with post-stabilization verification
 - **Metadata Tracking**: Comprehensive manifest system for processing history (reporting/logging only)
 
 ## Installation
@@ -19,6 +21,7 @@ A production-ready video processing pipeline designed for moderate-scale deep le
 
 - Python 3.10+ (CPython) or 3.11+ (PyPy)
 - FFmpeg (required for frame extraction, optional for validation - OpenCV fallback available)
+- FFmpeg with libvidstab (required for motion analysis/stabilization - most modern FFmpeg builds include this)
 
 ### Install Dependencies
 
@@ -98,6 +101,15 @@ scene_threshold: 3.0
 output_resolution: [256, 256]
 jpeg_quality: 75
 
+# Motion Analysis & Stabilization
+analyze_motion: false  # Enable camera motion detection per scene
+stabilize_video: false  # Create stabilized version before frame extraction
+motion_thresholds:
+  max_trans_low: 10.0    # Below this = static camera
+  max_trans_high: 50.0   # Above this = moving camera
+  max_angle_low: 0.02    # Below this = static (approx 1 degree)
+  max_angle_high: 0.1    # Above this = moving (approx 5 degrees)
+
 # Folder Structure
 flat_structure: false  # true = all scenes in one folder, false = hierarchical
 ```
@@ -139,6 +151,14 @@ Frame Extraction:
   --resolution WIDTHxHEIGHT    Output resolution (e.g., 256x256)
   --jpeg-quality N            JPEG quality 1-100 (default: 75)
 
+Motion Analysis & Stabilization:
+  --analyze-motion            Enable camera motion analysis (generates scenes.csv)
+  --stabilize-video           Stabilize video before frame extraction (requires --analyze-motion)
+  --max-trans-low FLOAT       Max translation threshold for static label (pixels)
+  --max-trans-high FLOAT      Max translation threshold for moving label (pixels)
+  --max-angle-low FLOAT       Max rotation threshold for static label (radians)
+  --max-angle-high FLOAT      Max rotation threshold for moving label (radians)
+
 Folder Structure:
   --flat-structure            Use flat structure (all scenes in one folder)
 
@@ -153,13 +173,19 @@ Logging:
 Examples:
   # Override output directory and download workers
   python scripts/process_videos.py --output-dir /path/to/output --num-workers 8
-  
+
   # Use different URLs file and skip validation
   python scripts/process_videos.py -u /path/to/urls.txt --skip-validation
-  
+
   # Custom resolution and quality
   python scripts/process_videos.py --resolution 512x512 --jpeg-quality 90
-  
+
+  # Enable motion analysis with custom thresholds
+  python scripts/process_videos.py --analyze-motion --max-trans-low 5.0 --max-trans-high 30.0
+
+  # Enable video stabilization (requires --analyze-motion)
+  python scripts/process_videos.py --analyze-motion --stabilize-video
+
   # Use CPU-only (disable GPU acceleration)
   python scripts/process_videos.py --use-cpu
 ```
@@ -177,6 +203,7 @@ video_dataset_processor/
 │   ├── integrity_checker.py   # Video validation (FFmpeg + OpenCV)
 │   ├── video_decoder.py       # OpenCV-based video decoding (used for scene detection fallback)
 │   ├── scene_detector.py      # Scene detection
+│   ├── motion_analyzer.py     # Camera motion analysis and stabilization
 │   ├── frame_processor.py     # OpenCV-based frame extraction (legacy)
 │   ├── frame_processor_ffmpeg.py  # FFmpeg-based frame extraction (current, faster)
 │   ├── manifest_manager.py    # Metadata tracking
@@ -200,6 +227,7 @@ Processed frames are organized by video and scene. By default (hierarchical stru
 ```
 data/processed/
 ├── video_001/
+│   ├── scenes.csv              # Motion analysis metadata (if --analyze-motion enabled)
 │   ├── scene_000/
 │   │   ├── frame_0000.jpg
 │   │   ├── frame_0001.jpg
@@ -213,10 +241,27 @@ data/processed/
 With `flat_structure: true`, all scenes are in a single `scenes/` folder:
 ```
 data/processed/scenes/
+├── video_001_scenes.csv        # Motion analysis metadata (if --analyze-motion enabled)
 ├── video_001_scene_000/
 ├── video_001_scene_001/
 └── ...
 ```
+
+### Motion Analysis CSV Format
+
+When `--analyze-motion` is enabled, a `scenes.csv` file is generated for each video with the following columns:
+
+- `scene_idx`: Scene index (0-based)
+- `start_frame`: First frame of scene (inclusive)
+- `end_frame`: Last frame of scene (exclusive)
+- `max_trans`: Maximum camera translation in pixels
+- `max_angle`: Maximum camera rotation in radians
+- `label`: Scene classification (`static`, `moving`, or `uncertain`)
+
+If `--stabilize-video` is also enabled, additional columns are included:
+- `stabilized_max_trans`: Maximum translation after stabilization
+- `stabilized_max_angle`: Maximum rotation after stabilization
+- `stabilized_label`: Scene classification after stabilization
 
 ## How It Works
 
@@ -232,10 +277,17 @@ For **20 videos × 1.5 hours** (30 hours total):
 | Download (4 workers) | 2-6 hours | 2-6 hours |
 | Validation (if enabled) | 30-60 minutes | 30-60 minutes |
 | Scene Detection | 15-30 minutes | 15-30 minutes |
+| Motion Analysis (if enabled) | 10-20 minutes | 10-20 minutes |
+| Stabilization (if enabled) | 30-60 minutes | 30-60 minutes |
 | Frame Extraction | 1-3 hours (FFmpeg CPU) | 15-45 minutes (FFmpeg GPU) |
-| **Total** | **3-9 hours** | **2-7 hours** |
+| **Total (no motion analysis)** | **3-9 hours** | **2-7 hours** |
+| **Total (with motion + stabilization)** | **4-11 hours** | **3-9 hours** |
 
-**Note**: Frame extraction uses FFmpeg single-pass processing with `filter_complex` to extract all scenes in one call (5-10x faster than OpenCV). This eliminates I/O contention and re-decoding overhead. GPU acceleration provides additional 3-5x speedup when available. If GPU fails for any reason, the system automatically falls back to CPU to ensure frames are always extracted.
+**Notes**:
+- Frame extraction uses FFmpeg single-pass processing with `filter_complex` to extract all scenes in one call (5-10x faster than OpenCV). This eliminates I/O contention and re-decoding overhead.
+- GPU acceleration provides additional 3-5x speedup when available. If GPU fails for any reason, the system automatically falls back to CPU to ensure frames are always extracted.
+- Motion analysis uses downscaled video (360p) for 4-10x speedup with negligible accuracy impact.
+- Stabilization requires two additional FFmpeg passes per video (detection + transformation).
 
 ## Hardware Recommendations
 
@@ -288,6 +340,7 @@ This is a production-ready implementation. For improvements:
 Built with:
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) - Video downloading
 - [FFmpeg](https://ffmpeg.org/) - Fast batch frame extraction with GPU acceleration
+- [FFmpeg libvidstab](http://public.hronopik.de/vid.stab/) - Camera motion analysis and video stabilization
 - [OpenCV](https://opencv.org/) - Video decoding (for scene detection fallback and validation)
 - [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) - Scene detection
 - [Pillow](https://python-pillow.org/) - Image processing

@@ -2,6 +2,7 @@
 Video processing pipeline - core orchestration logic.
 """
 
+import csv
 import logging
 import sys
 import time
@@ -14,6 +15,7 @@ from .scene_detector import SceneDetector
 from .frame_processor import FrameProcessor
 from .frame_processor_ffmpeg import FrameProcessorFFmpeg
 from .manifest_manager import ManifestManager
+from .motion_analyzer import MotionAnalyzer
 from .utils import format_time
 
 
@@ -71,7 +73,10 @@ def run_pipeline(config: Dict, skip_validation: bool = False, use_cpu: bool = Fa
         manifest_path=config.get('manifest_path', 'data/manifest.json'),
         logger=logger
     )
-    
+
+    # Initialize motion analyzer if enabled
+    motion_analyzer = MotionAnalyzer(logger=logger) if config.get('analyze_motion', False) else None
+
     # Stage 1: Download
     logger.info("=" * 60)
     logger.info("STAGE 1: DOWNLOADING VIDEOS")
@@ -176,22 +181,132 @@ def run_pipeline(config: Dict, skip_validation: bool = False, use_cpu: bool = Fa
 
             stats['total_scenes'] += len(scenes)
             print(f"  ✓ Found {len(scenes)} scene(s)")
-            
+
+            # Stage 3.5: Motion Analysis & Stabilization
+            processing_video_path = video_path  # Default to original
+            scene_motion_metadata = []
+            output_video_name = Path(video_path).stem  # Track which video we're extracting from
+
+            if motion_analyzer:
+                print(f"  [Stage 3.5] Analyzing motion...")
+                logger.info(f"Analyzing camera motion: {video_id}")
+
+                trf_path = Path(video_path).parent / f"{Path(video_path).stem}.trf"
+
+                if motion_analyzer.run_vidstab_detect(str(video_path), str(trf_path)):
+                    # Parse transformation data
+                    motion_data = motion_analyzer.parse_trf(str(trf_path))
+
+                    # Check if we actually got valid motion data
+                    has_valid_motion = len(motion_data.get('dx', [])) > 0
+
+                    if has_valid_motion:
+                        # Analyze scenes and assign labels
+                        thresholds = config.get('motion_thresholds', {})
+                        scene_motion_metadata = motion_analyzer.analyze_scenes(scenes, motion_data, thresholds)
+
+                        # Display original motion summary
+                        static_count = sum(1 for s in scene_motion_metadata if s['label'] == 'static')
+                        moving_count = sum(1 for s in scene_motion_metadata if s['label'] == 'moving')
+                        uncertain_count = sum(1 for s in scene_motion_metadata if s['label'] == 'uncertain')
+                        print(f"    Original: Static={static_count}, Moving={moving_count}, Uncertain={uncertain_count}")
+
+                        # Stabilization if enabled
+                        if config.get('stabilize_video', False):
+                            print(f"  [Stage 3.5] Stabilizing video...")
+                            logger.info(f"Stabilizing video: {video_id}")
+
+                            stabilized_path = Path(video_path).parent / f"{Path(video_path).stem}_stabilized.mp4"
+
+                            if motion_analyzer.stabilize_video(str(video_path), str(trf_path), str(stabilized_path)):
+                                processing_video_path = str(stabilized_path)
+                                output_video_name = Path(stabilized_path).stem  # Update output folder name
+                                print(f"  ✓ Video stabilized")
+
+                                # Post-stabilization analysis
+                                print(f"  [Stage 3.5] Analyzing stabilization result...")
+                                post_trf_path = Path(video_path).parent / f"{Path(video_path).stem}_post.trf"
+
+                                if motion_analyzer.run_vidstab_detect(str(stabilized_path), str(post_trf_path)):
+                                    post_motion_data = motion_analyzer.parse_trf(str(post_trf_path))
+
+                                    if len(post_motion_data.get('dx', [])) > 0:
+                                        post_metrics = motion_analyzer.analyze_scenes(scenes, post_motion_data, thresholds)
+
+                                        # Merge post-stabilization metrics into metadata
+                                        for i, meta in enumerate(scene_motion_metadata):
+                                            if i < len(post_metrics):
+                                                meta['stabilized_max_trans'] = post_metrics[i]['max_trans']
+                                                meta['stabilized_max_angle'] = post_metrics[i]['max_angle']
+                                                meta['stabilized_label'] = post_metrics[i]['label']
+
+                                        # Display post-stabilization summary
+                                        post_static = sum(1 for s in post_metrics if s['label'] == 'static')
+                                        post_moving = sum(1 for s in post_metrics if s['label'] == 'moving')
+                                        post_uncertain = sum(1 for s in post_metrics if s['label'] == 'uncertain')
+                                        print(f"    Stabilized: Static={post_static}, Moving={post_moving}, Uncertain={post_uncertain}")
+
+                                    # Cleanup post TRF
+                                    if post_trf_path.exists():
+                                        post_trf_path.unlink()
+                            else:
+                                logger.warning(f"Stabilization failed for {video_id}, using original video")
+                                print(f"  ⚠ Stabilization failed, using original video")
+                    else:
+                        logger.warning(f"No valid motion data parsed for {video_id}")
+                        print(f"  ⚠ No motion data found, skipping stabilization")
+
+                    # Cleanup TRF file
+                    if trf_path.exists():
+                        trf_path.unlink()
+                else:
+                    logger.warning(f"Motion analysis failed for {video_id}")
+                    print(f"  ⚠ Motion analysis failed")
+
             # Stage 4: Frame Extraction
             print(f"  [Stage 4] Extracting frames...")
             logger.info(f"Extracting frames: {video_id}")
             scene_metadata = frame_processor.process_video(
-                video_path,
+                processing_video_path,
                 scenes,
                 flat_structure=config.get('flat_structure', False),
                 use_gpu=not use_cpu
             )
-            
+
             frames_extracted = sum(s['saved_frames'] for s in scene_metadata)
             stats['total_frames'] += frames_extracted
             stats['processed'] += 1
             print(f"  ✓ Extracted {frames_extracted} frames")
-            
+
+            # Write CSV after frame extraction (so it's in the same folder as frames)
+            if scene_motion_metadata:
+                # Use output_video_name (which reflects whether we used stabilized video)
+                if config.get('flat_structure', False):
+                    # Flat: CSV goes in scenes folder
+                    csv_path = Path(config['output_dir']) / "scenes" / f"{output_video_name}_scenes.csv"
+                else:
+                    # Hierarchical: CSV goes in video folder
+                    csv_path = Path(config['output_dir']) / output_video_name / "scenes.csv"
+
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # Dynamic fieldnames based on what's in the metadata
+                if scene_motion_metadata:
+                    fieldnames = list(scene_motion_metadata[0].keys())
+
+                    with open(csv_path, 'w', newline='') as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(scene_motion_metadata)
+
+                    logger.info(f"Written scene metadata to {csv_path}")
+                    print(f"  ✓ Motion metadata saved to {csv_path.name}")
+
+            # Cleanup stabilized video if created
+            if processing_video_path != video_path and Path(processing_video_path).exists():
+                Path(processing_video_path).unlink()
+                logger.debug(f"Cleaned up stabilized video: {processing_video_path}")
+
             # Update manifest
             manifest.add_video(video_id, video_meta, validation, scene_metadata)
             manifest.save()

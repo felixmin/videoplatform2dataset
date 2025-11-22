@@ -184,6 +184,39 @@ flat_structure: false
 
 
 # ============================================================
+# MOTION ANALYSIS & STABILIZATION
+# ============================================================
+# Used by: MotionAnalyzer (src/motion_analyzer.py)
+# Requires: FFmpeg with libvidstab support
+
+# analyze_motion: Enable camera motion detection per scene
+# Uses FFmpeg vidstabdetect to estimate camera movement
+# Output: Per-video CSV file with scene motion labels (static/moving/uncertain)
+# true  - Analyze motion and generate scenes.csv with labels
+# false - Skip motion analysis (faster, no CSV output)
+analyze_motion: true
+
+# stabilize_video: Create a stabilized version before frame extraction
+# Requires: analyze_motion must be true
+# Trade-off: Slower (additional FFmpeg pass) but removes camera shake
+# true  - Generate temporary stabilized video, extract frames from it
+# false - Extract frames from original video (faster)
+# Note: If stabilization fails, automatically falls back to original video
+stabilize_video: true
+
+# motion_thresholds: Metrics for classifying scenes as static/moving/uncertain
+# Used by: MotionAnalyzer.analyze_scenes() (src/motion_analyzer.py)
+# Scenes with metrics between low and high are labeled "uncertain"
+# max_trans: Maximum translation in pixels (camera panning/tilting)
+# max_angle: Maximum rotation in radians (camera roll)
+motion_thresholds:
+  max_trans_low: 10.0    # Below this = static camera
+  max_trans_high: 50.0   # Above this = moving camera
+  max_angle_low: 0.02    # Below this = static (approx 1 degree)
+  max_angle_high: 0.1    # Above this = moving (approx 5 degrees)
+
+
+# ============================================================
 # PERFORMANCE
 # ============================================================
 
@@ -193,7 +226,7 @@ flat_structure: false
 # Speedup: 3-5x faster frame extraction vs CPU-only
 # Behavior:
 #   true  - Try GPU first, automatically fall back to CPU on ANY error (recommended)
-#           If GPU run fails for any reason (format errors, device issues, etc.), 
+#           If GPU run fails for any reason (format errors, device issues, etc.),
 #           automatically retries with CPU-only mode. No frames are lost.
 #   false - CPU-only (more compatible, slower, but always works)
 # Note: GPU failures are logged but do not stop processing - automatic CPU fallback ensures frames are extracted
